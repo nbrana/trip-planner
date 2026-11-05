@@ -137,8 +137,9 @@ async def plan(req: PlanRequest):
     if not req.walk_access and not req.park_ride:
         raise HTTPException(422, "Enable walking and/or park & ride access.")
     tz = ZoneInfo(s.timezone)
-    depart = req.depart_at or datetime.now(tz)
-    depart = depart.astimezone(tz) if depart.tzinfo else depart.replace(tzinfo=tz)
+    arrive_by = req.arrive_by is not None
+    when = req.arrive_by or req.depart_at or datetime.now(tz)
+    when = when.astimezone(tz) if when.tzinfo else when.replace(tzinfo=tz)
 
     drive: dict[str, DriveEstimate] | None = None
     if s.use_osrm and req.park_ride:
@@ -149,7 +150,7 @@ async def plan(req: PlanRequest):
         except (httpx.HTTPError, KeyError, ValueError) as e:
             log.warning("OSRM table failed, using estimates: %s", e)
 
-    result = await run_in_threadpool(planner.plan, req, depart, drive)
+    result = await run_in_threadpool(planner.plan, req, when, drive, arrive_by)
 
     if s.use_osrm:
         sem = asyncio.Semaphore(4)

@@ -80,3 +80,64 @@ def test_after_midnight_uses_previous_service_day(planner):
 def test_walk_only_when_close(planner):
     res = planner.plan(req((40.80, -74.20), (40.802, -74.201)), at(8))
     assert any(i.access_mode == "walk_only" for i in res.itineraries)
+
+
+# ------------------------------------------------------------------ arrive-by
+
+WEST, EAST, UPTOWN = (40.801, -74.25), (40.801, -74.16), (40.859, -74.201)
+
+
+def test_arrive_by_picks_latest_trip_that_makes_it(planner):
+    deadline = at(9)
+    res = planner.plan(req(WEST, EAST), deadline, arrive_by=True)
+    its = [i for i in res.itineraries if i.access_mode == "walk"]
+    assert len(its) == 3
+    assert all(i.end <= deadline for i in its)
+    # Latest departure first; buses every 15 min arriving S1_10 at :50/:05, so the 08:30 trip is the last that works.
+    assert its[0].legs[1].trip_id == "S1_0_014"
+    assert its[0].start > its[1].start > its[2].start
+    assert len({i.legs[1].trip_id for i in its}) == 3
+
+
+def test_arrive_by_with_transfer(planner):
+    deadline = at(9)
+    res = planner.plan(req(WEST, UPTOWN), deadline, arrive_by=True)
+    it = next(i for i in res.itineraries if bus_routes(i) == ["S1", "S2"])
+    buses = [l for l in it.legs if l.mode == "bus"]
+    assert it.end <= deadline
+    assert buses[1].start >= buses[0].end
+    walk = [l for l in it.legs if l.mode == "walk"]
+    assert walk[0].end <= buses[0].start and walk[-1].start >= buses[-1].end
+
+
+def test_arrive_by_park_and_ride(planner):
+    deadline = at(9)
+    res = planner.plan(req((40.90, -74.35), EAST, park_ride=True, max_drive_m=10000), deadline, arrive_by=True)
+    it = res.itineraries[0]
+    assert it.access_mode == "park_ride" and it.end <= deadline
+    assert [l.mode for l in it.legs[:2]] == ["drive", "walk"]
+
+
+@pytest.mark.parametrize("deadline_h,deadline_m", [(7, 3), (8, 41), (12, 0), (23, 30)])
+@pytest.mark.parametrize("o,d", [(WEST, EAST), (WEST, UPTOWN), (UPTOWN, (40.831, -74.281))])  # last: S2 -> S1 -> S3
+def test_arrive_by_consistent_with_depart_at(planner, o, d, deadline_h, deadline_m):
+    """Leaving when arrive-by says to must get you there by the deadline, and a forward search from that
+    departure can't arrive later than the deadline."""
+    deadline = at(deadline_h, deadline_m)
+    ab = [i for i in planner.plan(req(o, d), deadline, arrive_by=True).itineraries if i.access_mode == "walk"]
+    assert ab, "expected an arrive-by option"
+    best = ab[0]
+    assert best.end <= deadline
+    fwd = [i for i in planner.plan(req(o, d), best.start).itineraries if i.access_mode == "walk"]
+    assert fwd[0].end <= deadline
+
+
+def test_arrive_by_walk_only_ends_at_deadline(planner):
+    res = planner.plan(req((40.80, -74.20), (40.802, -74.201)), at(9), arrive_by=True)
+    w = next(i for i in res.itineraries if i.access_mode == "walk_only")
+    assert w.end == at(9)
+
+
+def test_request_rejects_both_times():
+    with pytest.raises(ValueError):
+        req(WEST, EAST, depart_at=at(8), arrive_by=at(9))

@@ -127,9 +127,10 @@ interface Props {
   selected: number;
   onSelect: (i: number) => void;
   vehicles: Record<string, Vehicle>;
+  arriveBy?: boolean;
 }
 
-export default function ItineraryList({ itineraries, selected, onSelect, vehicles }: Props) {
+export default function ItineraryList({ itineraries, selected, onSelect, vehicles, arriveBy = false }: Props) {
   return (
     <ul className="space-y-2">
       {itineraries.map((it, i) => {
@@ -148,9 +149,16 @@ export default function ItineraryList({ itineraries, selected, onSelect, vehicle
               }`}
             >
               <div className="flex items-baseline justify-between gap-2">
-                <span className="text-base font-semibold tabular-nums text-slate-900">
-                  {formatTime(it.start)} – {formatTime(it.end)}
-                </span>
+                {arriveBy ? (
+                  <span className="text-base text-slate-900">
+                    <span className="font-semibold">Leave by {formatTime(it.start)}</span>
+                    <span className="text-sm tabular-nums text-slate-500"> · arrive {formatTime(it.end)}</span>
+                  </span>
+                ) : (
+                  <span className="text-base font-semibold tabular-nums text-slate-900">
+                    {formatTime(it.start)} – {formatTime(it.end)}
+                  </span>
+                )}
                 <span className="text-sm font-medium text-slate-700">{formatDuration(it.duration_s)}</span>
               </div>
               <div className="mt-1.5 flex flex-wrap items-center gap-1">

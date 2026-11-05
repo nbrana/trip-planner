@@ -1,7 +1,9 @@
+import { localInputValue } from "../lib/format";
 import { CarIcon, WalkIcon } from "./Icons";
 
 export interface Options {
-  departAt: string;
+  timeMode: "depart" | "arrive";
+  departAt: string; // datetime-local value; "" = now (depart mode only)
   walkAccess: boolean;
   parkRide: boolean;
   maxWalkMi: number;
@@ -40,22 +42,43 @@ export default function PlanOptions({ value: o, onChange }: Props) {
   return (
     <div className="space-y-4">
       <div>
-        <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500">Leave at</label>
+        <div className="mb-1.5 inline-flex rounded-lg bg-slate-100 p-0.5 text-xs font-medium" role="radiogroup" aria-label="Time mode">
+          {(["depart", "arrive"] as const).map((m) => (
+            <button
+              key={m}
+              role="radio"
+              aria-checked={o.timeMode === m}
+              onClick={() => {
+                if (m === o.timeMode) return;
+                // Arrive-by needs a concrete time: default to an hour from now.
+                const departAt = m === "arrive" && !o.departAt ? localInputValue(new Date(Date.now() + 3600e3)) : o.departAt;
+                onChange({ ...o, timeMode: m, departAt });
+              }}
+              className={`rounded-md px-3 py-1 ${o.timeMode === m ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+            >
+              {m === "depart" ? "Leave at" : "Arrive by"}
+            </button>
+          ))}
+        </div>
         <div className="flex gap-1.5">
           <input
             type="datetime-local"
+            aria-label={o.timeMode === "depart" ? "Leave at" : "Arrive by"}
             value={o.departAt}
+            required={o.timeMode === "arrive"}
             onChange={(e) => set("departAt", e.target.value)}
             className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
           />
-          <button
-            onClick={() => set("departAt", "")}
-            className={`rounded-lg border px-3 text-sm ${
-              o.departAt === "" ? "border-blue-500 bg-blue-50 text-blue-700" : "border-slate-300 text-slate-600 hover:bg-slate-50"
-            }`}
-          >
-            Now
-          </button>
+          {o.timeMode === "depart" && (
+            <button
+              onClick={() => set("departAt", "")}
+              className={`rounded-lg border px-3 text-sm ${
+                o.departAt === "" ? "border-blue-500 bg-blue-50 text-blue-700" : "border-slate-300 text-slate-600 hover:bg-slate-50"
+              }`}
+            >
+              Now
+            </button>
+          )}
         </div>
       </div>
 

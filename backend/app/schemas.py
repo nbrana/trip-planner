@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Point(BaseModel):
@@ -13,13 +13,20 @@ class Point(BaseModel):
 class PlanRequest(BaseModel):
     origin: Point
     destination: Point
-    depart_at: datetime | None = Field(None, description="Local time; defaults to now")
+    depart_at: datetime | None = Field(None, description="Leave at this local time; defaults to now")
+    arrive_by: datetime | None = Field(None, description="Arrive no later than this local time (instead of depart_at)")
     walk_access: bool = Field(True, description="Allow walking from the origin to a stop")
     park_ride: bool = Field(False, description="Allow driving to a park & ride lot")
     max_walk_m: float = Field(800, ge=50, le=5000, description="Max walk for each walking leg")
     max_drive_m: float = Field(8000, ge=500, le=80000, description="Max drive to a park & ride lot")
     max_transfers: int = Field(2, ge=0, le=4)
     num_itineraries: int = Field(3, ge=1, le=8, description="Per access mode")
+
+    @model_validator(mode="after")
+    def _one_time(self):
+        if self.depart_at is not None and self.arrive_by is not None:
+            raise ValueError("Give depart_at or arrive_by, not both")
+        return self
 
 
 class Place(BaseModel):

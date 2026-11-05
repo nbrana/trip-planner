@@ -114,3 +114,16 @@ def test_vehicle_and_alert_attached(planner, tt):
     leg = plan_s1(planner, snap)
     assert leg.vehicle and leg.vehicle.label == "1602" and leg.vehicle.occupancy == "Few seats available"
     assert [a.header for a in leg.alerts] == ["Detour on S1"]
+
+
+def test_arrive_by_skips_trip_made_late_by_delay(planner, tt):
+    """The 08:30 S1 trip normally makes a 09:00 deadline; 10 min late it no longer does."""
+    req = PlanRequest(origin=Point(lat=40.801, lon=-74.25), destination=Point(lat=40.801, lon=-74.16))
+    deadline = datetime(2026, 11, 4, 9, 0, tzinfo=TZ)
+    planner.realtime_snapshot = lambda: None
+    bus = lambda res: next(l for l in res.itineraries[0].legs if l.mode == "bus")  # noqa: E731
+    assert bus(planner.plan(req, deadline, arrive_by=True)).trip_id == "S1_0_014"
+    delays, _ = parse_trip_updates(tt, build_trip_index(tt), feed(delayed("S1_0_014", 2, 8, 32, 600)), TZ)
+    planner.realtime_snapshot = lambda: Snapshot(version=9, today=DAY, delays=delays)
+    res = planner.plan(req, deadline, arrive_by=True)
+    assert bus(res).trip_id == "S1_0_013" and res.itineraries[0].end <= deadline

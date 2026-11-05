@@ -9,6 +9,7 @@ import { formatTime, miToM } from "./lib/format";
 import type { Health, Lot, Place, PlanResponse, RouteInfo, Vehicle } from "./lib/types";
 
 const DEFAULT_OPTIONS: Options = {
+  timeMode: "depart",
   departAt: "",
   walkAccess: true,
   parkRide: false,
@@ -21,7 +22,8 @@ const OPTIONS_KEY = "trip-planner-options";
 function loadOptions(): Options {
   try {
     const saved = JSON.parse(localStorage.getItem(OPTIONS_KEY) ?? "{}");
-    return { ...DEFAULT_OPTIONS, ...saved, departAt: "" };
+    // Times aren't restored (they go stale); arrive-by without a time falls back to leaving now.
+    return { ...DEFAULT_OPTIONS, ...saved, departAt: "", timeMode: "depart" };
   } catch {
     return DEFAULT_OPTIONS;
   }
@@ -57,7 +59,7 @@ export default function App() {
   const [options, setOptions] = useState<Options>(loadOptions);
   const [picking, setPicking] = useState<Target | null>(null);
   const [lots, setLots] = useState<Lot[]>([]);
-  const [result, setResult] = useState<PlanResponse | null>(null);
+  const [result, setResult] = useState<(PlanResponse & { arriveBy: boolean }) | null>(null);
   const [selected, setSelected] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -117,7 +119,9 @@ export default function App() {
       }
     : null;
 
-  const canPlan = origin && destination && (options.walkAccess || options.parkRide) && !loading;
+  const arriveBy = options.timeMode === "arrive";
+  const canPlan =
+    origin && destination && (options.walkAccess || options.parkRide) && (!arriveBy || options.departAt) && !loading;
 
   const plan = async (keepSelection = false) => {
     if (!origin || !destination) return;
@@ -127,7 +131,8 @@ export default function App() {
       const res = await api.plan({
         origin: { lat: origin.lat, lon: origin.lon, name: origin.name },
         destination: { lat: destination.lat, lon: destination.lon, name: destination.name },
-        depart_at: options.departAt || null,
+        depart_at: arriveBy ? null : options.departAt || null,
+        arrive_by: arriveBy ? options.departAt : null,
         walk_access: options.walkAccess,
         park_ride: options.parkRide,
         max_walk_m: miToM(options.maxWalkMi),
@@ -135,7 +140,7 @@ export default function App() {
         max_transfers: options.maxTransfers,
         num_itineraries: 3,
       });
-      setResult(res);
+      setResult({ ...res, arriveBy });
       setPlannedAt(new Date());
       setSelected((s) => (keepSelection && s < res.itineraries.length ? s : 0));
     } catch (e) {
@@ -237,7 +242,7 @@ export default function App() {
                 <>
                   <div className="flex items-center justify-between text-xs text-slate-500">
                     <span>
-                      {realtimeOn ? "Times include live predictions" : "Scheduled times"}
+                      {result.itineraries.some((i) => i.legs.some((l) => l.realtime)) ? "Times include live predictions" : "Scheduled times"}
                       {plannedAt && ` · as of ${plannedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`}
                     </span>
                     <button
@@ -249,7 +254,7 @@ export default function App() {
                     </button>
                   </div>
                   <ItineraryList itineraries={result.itineraries} selected={selected} onSelect={setSelected}
-                    vehicles={vehicles} />
+                    vehicles={vehicles} arriveBy={result.arriveBy} />
                 </>
               )}
             </section>

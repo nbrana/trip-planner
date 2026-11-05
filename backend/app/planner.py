@@ -132,6 +132,44 @@ class DayView:
         return self._cache[pi]
 
 
+def _drop_dominated(its: list[Itinerary]) -> list[Itinerary]:
+    """Remove options another option matches or beats on leave time, arrival and transfers
+    (e.g. same first bus but a later arrival). Exact ties keep the first."""
+    def beats(a: Itinerary, b: Itinerary) -> bool:
+        return a.start >= b.start and a.end <= b.end and a.transfers <= b.transfers
+
+    keep = []
+    for i, it in enumerate(its):
+        if not any(beats(o, it) and (not beats(it, o) or j < i) for j, o in enumerate(its) if j != i):
+            keep.append(it)
+    return keep
+
+
+class _Direction:
+    """Pattern access for RAPTOR. reverse=True presents a time-reversed timetable (stop order reversed,
+    times negated) so the same forward search finds the *latest departure* that meets a deadline."""
+
+    def __init__(self, tt: Timetable, view: DayView, reverse: bool):
+        self.tt, self.view, self.reverse = tt, view, reverse
+        self._cache: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+    def positions(self, s: int):
+        if not self.reverse:
+            return self.tt.stop_patterns[s]
+        pats = self.tt.patterns
+        return [(pi, len(pats[pi].stops) - 1 - pos) for pi, pos in self.tt.stop_patterns[s]]
+
+    def pattern(self, pi: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(stops, arr, dep) in search order."""
+        hit = self._cache.get(pi)
+        if hit is None:
+            pd = self.view.trips(pi)
+            stops = self.tt.patterns[pi].stops
+            hit = (stops[::-1], -pd.dep[:, ::-1], -pd.arr[:, ::-1]) if self.reverse else (stops, pd.arr, pd.dep)
+            self._cache[pi] = hit
+        return hit
+
+
 class Planner:
     def __init__(self, tt: Timetable, lots: list[ParkRideLot], settings: Settings):
         self.tt = tt
@@ -209,8 +247,9 @@ class Planner:
 
     # --------------------------------------------------------------- RAPTOR
 
-    def _raptor(self, view: DayView, access: dict[int, AccessOption], egress: dict[int, EgressOption],
+    def _raptor(self, dirn: _Direction, access: dict, egress: dict,
                 t0: int, max_rounds: int, transfer_m: float) -> list[_Journey]:
+        """Earliest-arrival RAPTOR. `access`/`egress` map stop -> option with .duration_s."""
         tt = self.tt
         slack = self.s.min_transfer_s
         best: dict[int, int] = {}
@@ -236,17 +275,15 @@ class Planner:
             labels.append(cur)
             queue: dict[int, int] = {}
             for s in marked:
-                for pi, pos in tt.stop_patterns[s]:
+                for pi, pos in dirn.positions(s):
                     if pos < queue.get(pi, 1 << 30):
                         queue[pi] = pos
             improved: set[int] = set()
 
             for pi, pos0 in queue.items():
-                pd_ = view.trips(pi)
-                arr, dep = pd_.arr, pd_.dep
+                stops, arr, dep = dirn.pattern(pi)
                 if len(dep) == 0:
                     continue
-                stops = tt.patterns[pi].stops
                 trip = -1
                 board: tuple[int, int, int] | None = None
                 for pos in range(pos0, len(stops)):
@@ -422,43 +459,74 @@ class Planner:
             park_ride_lot=acc.lot.name if acc.lot else None, legs=legs,
         )
 
-    def _search(self, view: DayView, access, egress, t0: int, req: PlanRequest,
-                midnight: datetime, origin: Place, dest: Place) -> list[Itinerary]:
+    def _unreverse(self, view: DayView, j: _Journey) -> _Journey:
+        """Turn a journey found on the reversed timetable back into forward order."""
+        legs: list[_BusLeg | _TransferLeg] = []
+        for leg in reversed(j.legs):
+            if isinstance(leg, _BusLeg):
+                m = len(self.tt.patterns[leg.pattern].stops)
+                legs.append(_BusLeg(leg.pattern, leg.trip, m - 1 - leg.alight_pos, m - 1 - leg.board_pos))
+            else:
+                # Walk right after getting off the previous bus.
+                prev = legs[-1]
+                start = int(view.trips(prev.pattern).arr[prev.trip, prev.alight_pos])
+                legs.append(_TransferLeg(leg.dst, leg.src, leg.dist_m, start, start + self.walk_s(leg.dist_m)))
+        last = legs[-1]
+        egress = j.access  # the reversed search started from the destination side
+        arrival = int(view.trips(last.pattern).arr[last.trip, last.alight_pos]) + egress.duration_s
+        return _Journey(j.egress, legs, egress, arrival)
+
+    def _search(self, view: DayView, access, egress, t: int, req: PlanRequest,
+                midnight: datetime, origin: Place, dest: Place, arrive_by: bool) -> list[Itinerary]:
+        """Depart-at: earliest arrivals from t, then later departures.
+        Arrive-by: latest departures arriving by t, then earlier ones."""
         transfer_m = min(req.max_walk_m, self.s.max_transfer_walk_m) / self.s.walk_detour
+        dirn = _Direction(self.tt, view, reverse=arrive_by)
         out: list[Itinerary] = []
         seen: set[tuple] = set()
-        t = t0
         for _ in range(req.num_itineraries * 3):
-            journeys = self._raptor(view, access, egress, t, req.max_transfers + 1, transfer_m)
+            if arrive_by:
+                found = self._raptor(dirn, egress, access, -t, req.max_transfers + 1, transfer_m)
+                journeys = [self._unreverse(view, j) for j in found]
+            else:
+                journeys = self._raptor(dirn, access, egress, t, req.max_transfers + 1, transfer_m)
             if not journeys:
                 break
-            next_t = INF
+            nxt = -INF if arrive_by else INF
             for j in journeys:
                 bus = [l for l in j.legs if isinstance(l, _BusLeg)]
-                dep = view.trips(bus[0].pattern).dep
-                leave = int(dep[bus[0].trip, bus[0].board_pos]) - j.access.duration_s
-                next_t = min(next_t, leave + 60)
+                if arrive_by:  # next search: must arrive strictly earlier
+                    nxt = max(nxt, j.arrival - 60)
+                else:  # next search: leave just after this option's latest leave time
+                    leave = int(view.trips(bus[0].pattern).dep[bus[0].trip, bus[0].board_pos]) - j.access.duration_s
+                    nxt = min(nxt, leave + 60)
                 key = tuple((l.pattern, int(view.trips(l.pattern).rows[l.trip])) for l in bus)
                 if key not in seen:
                     seen.add(key)
                     out.append(self._to_itinerary(view, j, midnight, origin, dest))
+            out = _drop_dominated(out)
             if len(out) >= req.num_itineraries:
                 break
-            t = max(next_t, t + 60)
-        out.sort(key=lambda i: (i.end, i.duration_s))
+            t = min(nxt, t - 60) if arrive_by else max(nxt, t + 60)
+        if arrive_by:
+            out.sort(key=lambda i: (-i.start.timestamp(), i.duration_s))
+        else:
+            out.sort(key=lambda i: (i.end, i.duration_s))
         return out[: req.num_itineraries]
 
-    def plan(self, req: PlanRequest, depart: datetime,
-             drive: dict[str, DriveEstimate] | None = None) -> PlanResponse:
+    def plan(self, req: PlanRequest, when: datetime, drive: dict[str, DriveEstimate] | None = None,
+             arrive_by: bool = False) -> PlanResponse:
+        """Plan leaving at `when`, or (arrive_by=True) arriving no later than `when`."""
         notes: list[str] = []
-        midnight = datetime.combine(depart.date(), time(0), tzinfo=depart.tzinfo)
-        t0 = int((depart.replace(tzinfo=None) - midnight.replace(tzinfo=None)).total_seconds())
-        view = self._view(depart.date())
+        midnight = datetime.combine(when.date(), time(0), tzinfo=when.tzinfo)
+        t0 = int((when.replace(tzinfo=None) - midnight.replace(tzinfo=None)).total_seconds())
+        view = self._view(when.date())
+        depart = when
         o, d = req.origin, req.destination
         origin = Place(name=o.name or "Origin", lat=o.lat, lon=o.lon)
         dest = Place(name=d.name or "Destination", lat=d.lat, lon=d.lon)
 
-        if self.tt.feed_start and self.tt.feed_end and not (self.tt.feed_start <= depart.date() <= self.tt.feed_end):
+        if self.tt.feed_start and self.tt.feed_end and not (self.tt.feed_start <= when.date() <= self.tt.feed_end):
             notes.append(f"Date is outside the schedule's range ({self.tt.feed_start} to {self.tt.feed_end}).")
 
         egress = self.egress(d.lat, d.lon, req.max_walk_m)
@@ -469,7 +537,7 @@ class Planner:
             if req.walk_access:
                 acc = self.walk_access(o.lat, o.lon, req.max_walk_m)
                 if acc:
-                    itins += self._search(view, acc, egress, t0, req, midnight, origin, dest)
+                    itins += self._search(view, acc, egress, t0, req, midnight, origin, dest, arrive_by)
                 else:
                     notes.append("No bus stops within walking distance of the origin.")
             if req.park_ride:
@@ -478,13 +546,15 @@ class Planner:
                 else:
                     acc = self.park_ride_access(o.lat, o.lon, req.max_drive_m, drive)
                     if acc:
-                        itins += self._search(view, acc, egress, t0, req, midnight, origin, dest)
+                        itins += self._search(view, acc, egress, t0, req, midnight, origin, dest, arrive_by)
                     else:
                         notes.append("No park & ride lots with nearby bus stops within driving distance.")
 
         direct = haversine_m(o.lat, o.lon, d.lat, d.lon) * self.s.walk_detour
         if req.walk_access and direct <= req.max_walk_m:
             dur = self.walk_s(direct)
+            if arrive_by:
+                depart = when - timedelta(seconds=dur)
             itins.append(Itinerary(
                 access_mode="walk_only", start=depart, end=depart + timedelta(seconds=dur), duration_s=dur,
                 transfers=0, walk_m=round(direct, 1), drive_m=0, wait_s=0,
@@ -493,6 +563,10 @@ class Planner:
             ))
 
         if not itins and egress and not notes:
-            notes.append("No trips found for this time. Try a later time, more transfers, or longer distances.")
-        itins.sort(key=lambda i: (i.end, i.duration_s))
+            notes.append(f"No trips found for this time. Try {'a later arrival' if arrive_by else 'a later time'}, "
+                         "more transfers, or longer distances.")
+        if arrive_by:
+            itins.sort(key=lambda i: (-i.start.timestamp(), i.duration_s))
+        else:
+            itins.sort(key=lambda i: (i.end, i.duration_s))
         return PlanResponse(itineraries=itins, notes=notes)

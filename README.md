@@ -60,7 +60,8 @@ The API token is cached in `data/cache/njt_token.json` so restarts don't re-auth
 
 - **Transit**: [RAPTOR](https://www.microsoft.com/en-us/research/publication/round-based-public-transit-routing/). Trips are grouped into stop patterns. Each round adds one more bus ride, and the router returns results that are best on arrival time versus number of transfers. After-midnight trips from the previous service day are included.
 - **Walk and drive legs** are estimated from straight-line distance × a detour factor ÷ speed (all configurable in `.env`). Set `USE_OSRM=true` to use the public OSRM servers instead. Drive times then come from real roads, and walk and drive legs follow the actual streets on the map.
-- **Multiple options**: the search re-runs just after each found departure to get later options.
+- **Arrive by**: the same RAPTOR runs on a time-reversed view of the timetable (stop order reversed, times negated). That finds the *latest* departure that still arrives by the deadline, and the result is converted back to forward order. Live delays apply the same way.
+- **Multiple options**: the search re-runs just after each found departure (or, for arrive-by, with a deadline just before each found arrival) to get more options. Options another option matches or beats on leave time, arrival and transfers are dropped.
 
 ## API
 
@@ -78,6 +79,5 @@ Interactive docs: <http://localhost:8000/docs>.
 
 ## Known limitations / next steps
 
-- Each search uses a single departure time. There is no "arrive by" option yet.
 - Public Nominatim/OSRM/OSM tiles are for light use only. Self-host them for anything beyond development.
 - Map data © OpenStreetMap contributors (ODbL).

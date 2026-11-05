@@ -92,6 +92,7 @@ export interface PlanRequest {
   origin: { lat: number; lon: number; name?: string };
   destination: { lat: number; lon: number; name?: string };
   depart_at: string | null;
+  arrive_by: string | null;
   walk_access: boolean;
   park_ride: boolean;
   max_walk_m: number;
