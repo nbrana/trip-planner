@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     # --- NJ Transit developer portal (only needed by scripts/fetch_gtfs.py) --
     njt_username: str | None = None
     njt_password: str | None = None
-    njt_bus_api_base: str = "https://pcsdata.njtransit.com/api/BUSDV2"
+    njt_bus_api_base: str = "https://pcsdata.njtransit.com/api/GTFSG2"
 
     # --- OpenStreetMap services (no keys required, but respect usage policies)
     user_agent: str = "nj-trip-planner/0.1 (local development)"

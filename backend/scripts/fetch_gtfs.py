@@ -4,10 +4,10 @@
 2. Put NJT_USERNAME / NJT_PASSWORD in backend/.env
 3. uv run python scripts/fetch_gtfs.py
 
-The API flow (authenticateUser -> UserToken -> getGTFS) follows NJ Transit's
-BUSDV2 API. If NJ Transit changes endpoint names, check the Swagger docs at
-https://pcsdata.njtransit.com/swagger and adjust NJT_BUS_API_BASE or the paths
-below. Alternatively, download the bus GTFS zip manually from the portal and
+The API flow (authenticateUser -> UserToken -> getGTFS) uses NJ Transit's
+GTFSG2 API, which serves the bus feed (BUSDV2 is the bus departures API and has
+no getGTFS endpoint). If NJ Transit changes endpoint names,
+check https://pcsdata.njtransit.com/swagger and adjust NJT_BUS_API_BASE. Alternatively, download the bus GTFS zip manually from the portal and
 save it as backend/data/njt_bus_gtfs.zip.
 """
 
