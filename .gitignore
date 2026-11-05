@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+.venv/
+.pytest_cache/
+backend/.env
+backend/data/cache/
+backend/data/njt_bus_gtfs.zip
+backend/data/park_rides.json
+
+# Node
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo

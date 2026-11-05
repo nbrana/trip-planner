@@ -1,0 +1,16 @@
+[
+  {
+    "id": "sample-north",
+    "name": "Sample Hill Park & Ride",
+    "lat": 40.8625,
+    "lon": -74.3015,
+    "capacity": 250
+  },
+  {
+    "id": "sample-east",
+    "name": "Sample East Park & Ride",
+    "lat": 40.8025,
+    "lon": -74.1385,
+    "capacity": 120
+  }
+]
