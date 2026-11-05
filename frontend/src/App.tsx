@@ -6,6 +6,7 @@ import PlanOptions, { type Options } from "./components/PlanOptions";
 import { BusIcon, SwapIcon } from "./components/Icons";
 import { api } from "./lib/api";
 import { formatTime, miToM } from "./lib/format";
+import { addRecent, clearRecents, loadRecents, removeRecent } from "./lib/recents";
 import type { Health, Lot, Place, PlanResponse, RouteInfo, Vehicle } from "./lib/types";
 
 const DEFAULT_OPTIONS: Options = {
@@ -65,6 +66,9 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [vehicles, setVehicles] = useState<Record<string, Vehicle>>({});
   const [plannedAt, setPlannedAt] = useState<Date | null>(null);
+  const [recents, setRecents] = useState<Place[]>(loadRecents);
+  const remember = (...ps: (Place | null)[]) =>
+    setRecents((list) => ps.reduce((l, p) => (p ? addRecent(l, p) : l), list));
 
   useEffect(() => {
     const load = () =>
@@ -125,6 +129,7 @@ export default function App() {
 
   const plan = async (keepSelection = false) => {
     if (!origin || !destination) return;
+    remember(destination, origin); // origin ends up most recent
     setLoading(true);
     setError(null);
     try {
@@ -203,9 +208,13 @@ export default function App() {
           )}
 
           <div className="relative space-y-3">
-            <LocationSearch label="From" dotClass="bg-green-600" value={origin} onChange={setOrigin}
+            <LocationSearch label="From" dotClass="bg-green-600" value={origin} onChange={(p) => { setOrigin(p); remember(p); }}
+              recents={recents} onRemoveRecent={(p) => setRecents((l) => removeRecent(l, p))}
+              onClearRecents={() => setRecents(clearRecents())}
               picking={picking === "origin"} onPick={() => setPicking(picking === "origin" ? null : "origin")} />
-            <LocationSearch label="To" dotClass="bg-red-600" value={destination} onChange={setDestination}
+            <LocationSearch label="To" dotClass="bg-red-600" value={destination} onChange={(p) => { setDestination(p); remember(p); }}
+              recents={recents} onRemoveRecent={(p) => setRecents((l) => removeRecent(l, p))}
+              onClearRecents={() => setRecents(clearRecents())}
               picking={picking === "destination"} onPick={() => setPicking(picking === "destination" ? null : "destination")} />
             <button
               onClick={() => { setOrigin(destination); setDestination(origin); }}

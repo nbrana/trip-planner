@@ -2,7 +2,7 @@ import { useState } from "react";
 import { api } from "../lib/api";
 import { shortName } from "../lib/format";
 import type { Place } from "../lib/types";
-import { PinIcon } from "./Icons";
+import { ClockIcon, PinIcon } from "./Icons";
 
 interface Props {
   label: string;
@@ -11,12 +11,19 @@ interface Props {
   onChange: (p: Place | null) => void;
   picking: boolean;
   onPick: () => void;
+  recents: Place[];
+  onRemoveRecent: (p: Place) => void;
+  onClearRecents: () => void;
 }
 
-// Nominatim's usage policy forbids search-as-you-type, so search runs on Enter / button.
-export default function LocationSearch({ label, dotClass, value, onChange, picking, onPick }: Props) {
+// Nominatim's usage policy forbids search-as-you-type, so address search runs on Enter / button.
+// Recent places are local, so they filter as you type.
+export default function LocationSearch({
+  label, dotClass, value, onChange, picking, onPick, recents, onRemoveRecent, onClearRecents,
+}: Props) {
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState(false);
+  const [focused, setFocused] = useState(false);
   const [results, setResults] = useState<Place[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -38,10 +45,20 @@ export default function LocationSearch({ label, dotClass, value, onChange, picki
     onChange(p);
     setResults(null);
     setEditing(false);
+    setFocused(false);
     setQuery("");
   };
 
+  const close = () => {
+    setEditing(false);
+    setResults(null);
+    setFocused(false);
+  };
+
   const showInput = editing || !value;
+  const q = query.trim().toLowerCase();
+  const matchingRecents = recents.filter((r) => !q || r.name.toLowerCase().includes(q));
+  const showRecents = showInput && focused && !results && matchingRecents.length > 0;
 
   return (
     <div className="relative">
@@ -61,9 +78,16 @@ export default function LocationSearch({ label, dotClass, value, onChange, picki
             <input
               autoFocus={editing}
               value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => e.key === "Escape" && (setEditing(false), setResults(null))}
+              onChange={(e) => {
+                setQuery(e.target.value);
+                setResults(null);
+              }}
+              onFocus={() => setFocused(true)}
+              // Delay so a click on a dropdown item lands before it closes.
+              onBlur={() => setTimeout(() => setFocused(false), 150)}
+              onKeyDown={(e) => e.key === "Escape" && close()}
               placeholder="Address or place, then Enter"
+              aria-label={label}
               className="min-w-0 flex-1 rounded-l-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
             />
             <button
@@ -94,6 +118,38 @@ export default function LocationSearch({ label, dotClass, value, onChange, picki
         </button>
       </div>
       {error && <p className="mt-1 text-xs text-red-600">{error}</p>}
+
+      {showRecents && (
+        <div
+          className="absolute z-[1000] mt-1 w-full overflow-hidden rounded-lg border border-slate-200 bg-white text-sm shadow-lg"
+          onMouseDown={(e) => e.preventDefault() /* keep input focus while clicking */}
+        >
+          <div className="flex items-center justify-between px-3 pb-1 pt-2 text-xs font-medium uppercase tracking-wide text-slate-400">
+            <span>Recent</span>
+            <button onClick={onClearRecents} className="normal-case tracking-normal text-slate-500 hover:text-slate-800">
+              Clear
+            </button>
+          </div>
+          <ul className="max-h-64 overflow-auto pb-1">
+            {matchingRecents.map((r) => (
+              <li key={`${r.lat},${r.lon}`} className="group flex items-center hover:bg-slate-50">
+                <button onClick={() => choose(r)} title={r.name} className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left">
+                  <ClockIcon className="h-4 w-4 shrink-0 text-slate-400" />
+                  <span className="truncate">{shortName(r.name)}</span>
+                </button>
+                <button
+                  onClick={() => onRemoveRecent(r)}
+                  aria-label={`Remove ${shortName(r.name)} from recent places`}
+                  className="px-3 py-2 text-slate-400 opacity-60 hover:text-slate-700 group-hover:opacity-100"
+                >
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {results && (
         <ul className="absolute z-[1000] mt-1 max-h-64 w-full overflow-auto rounded-lg border border-slate-200 bg-white text-sm shadow-lg">
           {results.length === 0 && <li className="px-3 py-2 text-slate-500">No matches</li>}
