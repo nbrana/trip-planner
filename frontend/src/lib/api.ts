@@ -1,4 +1,4 @@
-import type { Health, Lot, Place, PlanRequest, PlanResponse } from "./types";
+import type { Health, Lot, Place, PlanRequest, PlanResponse, Vehicle } from "./types";
 
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -21,6 +21,10 @@ export const api = {
     fetch(`/api/reverse?lat=${lat}&lon=${lon}`).then((r) => json<Place | null>(r)),
   lots: (lat: number, lon: number, radius_m: number) =>
     fetch(`/api/park-rides?lat=${lat}&lon=${lon}&radius_m=${radius_m}`).then((r) => json<Lot[]>(r)),
+  vehicles: (tripIds: string[]) =>
+    fetch(`/api/vehicles?${tripIds.map((t) => `trip_id=${encodeURIComponent(t)}`).join("&")}`).then((r) =>
+      json<Vehicle[]>(r),
+    ),
   plan: (body: PlanRequest) =>
     fetch("/api/plan", {
       method: "POST",

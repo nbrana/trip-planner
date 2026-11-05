@@ -1,8 +1,8 @@
 import { useEffect } from "react";
 import L from "leaflet";
-import { Circle, CircleMarker, MapContainer, Polyline, TileLayer, Tooltip, useMap, useMapEvents } from "react-leaflet";
-import { LEG_COLORS, formatDistance } from "../lib/format";
-import type { Itinerary, Lot, Place } from "../lib/types";
+import { Circle, CircleMarker, MapContainer, Marker, Polyline, TileLayer, Tooltip, useMap, useMapEvents } from "react-leaflet";
+import { LEG_COLORS, formatAgo, formatDistance } from "../lib/format";
+import type { Itinerary, Lot, Place, RouteInfo, Vehicle } from "../lib/types";
 
 interface Props {
   origin: Place | null;
@@ -12,6 +12,22 @@ interface Props {
   lots: Lot[];
   itinerary: Itinerary | null;
   onMapClick: ((lat: number, lon: number) => void) | null;
+  liveBuses: { vehicle: Vehicle; route: RouteInfo }[];
+}
+
+const esc = (t: string) => t.replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`);
+
+function busIcon(route: RouteInfo, bearing: number | null) {
+  const arrow =
+    bearing == null
+      ? ""
+      : `<span style="position:absolute;left:50%;top:50%;width:0;height:0;transform:translate(-50%,-50%) rotate(${bearing}deg) translateY(-19px);border:5px solid transparent;border-bottom:7px solid ${route.color}"></span>`;
+  return L.divIcon({
+    className: "",
+    iconSize: [30, 22],
+    iconAnchor: [15, 11],
+    html: `<div style="position:relative;width:30px;height:22px">${arrow}<div style="width:30px;height:22px;border-radius:6px;background:${route.color};color:${route.text_color};border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.4);font:700 11px/18px system-ui;text-align:center;overflow:hidden">${esc(route.short_name)}</div></div>`,
+  });
 }
 
 function ClickHandler({ onClick }: { onClick: Props["onMapClick"] }) {
@@ -31,9 +47,10 @@ function FitBounds({ points }: { points: [number, number][] }) {
 
 const NJ_CENTER: [number, number] = [40.3, -74.5];
 
-export default function MapView({ origin, destination, walkRadiusM, driveRadiusM, lots, itinerary, onMapClick }: Props) {
+export default function MapView({ origin, destination, walkRadiusM, driveRadiusM, lots, itinerary, onMapClick, liveBuses }: Props) {
+  // Include the bus's position at planning time so an approaching bus is in view (not live polls, to avoid re-fitting).
   const fit: [number, number][] = itinerary
-    ? itinerary.legs.flatMap((l) => l.geometry)
+    ? itinerary.legs.flatMap((l) => (l.vehicle ? [...l.geometry, [l.vehicle.lat, l.vehicle.lon] as [number, number]] : l.geometry))
     : [origin, destination].filter((p): p is Place => !!p).map((p) => [p.lat, p.lon]);
 
   return (
@@ -88,6 +105,16 @@ export default function MapView({ origin, destination, walkRadiusM, driveRadiusM
             <Tooltip>{p.name}</Tooltip>
           </CircleMarker>
         ))}
+
+      {liveBuses.map(({ vehicle: v, route }) => (
+        <Marker key={v.trip_id} position={[v.lat, v.lon]} icon={busIcon(route, v.bearing)} zIndexOffset={1000}>
+          <Tooltip>
+            Live: {route.short_name} bus {v.label ?? ""}
+            {v.occupancy ? ` · ${v.occupancy}` : ""}
+            {v.timestamp ? ` · ${formatAgo(v.timestamp)}` : ""}
+          </Tooltip>
+        </Marker>
+      ))}
 
       {origin && (
         <CircleMarker center={[origin.lat, origin.lon]} radius={9}

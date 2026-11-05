@@ -32,6 +32,42 @@ export interface Leg {
   headsign: string | null;
   trip_id: string | null;
   intermediate_stops: StopVisit[];
+  realtime: boolean;
+  scheduled_start: string | null;
+  scheduled_end: string | null;
+  delay_s: number | null;
+  vehicle: Vehicle | null;
+  alerts: Alert[];
+}
+
+export interface Vehicle {
+  trip_id: string;
+  route_id: string | null;
+  lat: number;
+  lon: number;
+  bearing: number | null;
+  timestamp: number | null;
+  label: string | null;
+  occupancy: string | null;
+}
+
+export interface Alert {
+  id: string;
+  header: string;
+  description: string;
+  url: string | null;
+  route_ids: string[];
+}
+
+export interface RealtimeStatus {
+  enabled: boolean;
+  last_update: string | null;
+  feed_time: string | null;
+  trips_with_predictions: number;
+  canceled_trips: number;
+  vehicles: number;
+  alerts: number;
+  error: string | null;
 }
 
 export interface Itinerary {
@@ -83,4 +119,5 @@ export interface Health {
   feed_end: string | null;
   park_ride_lots: number;
   use_osrm: boolean;
+  realtime: RealtimeStatus;
 }

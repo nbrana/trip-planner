@@ -5,6 +5,7 @@ This planner covers NJ Transit buses. It uses the static GTFS schedule for the b
 - **Walk access**: set a max walking distance. It applies to the first stop, transfers, and the destination.
 - **Park & Ride access**: set a max driving distance. The planner drives you to a nearby P&R lot (from OSM), adds parking time, then walks you to a stop near the lot.
 - The planner returns the best options for each access mode, with several departures, colored route legs, and stop-by-stop times.
+- **Real-time**: with NJ Transit credentials, the backend checks NJT's live feeds every 30 seconds. Routing uses predicted times and skips canceled trips. The app shows on-time/late badges, live bus positions on the map, and route alerts.
 
 ```
 backend/   FastAPI + pandas/numpy, RAPTOR transit router (Python)
@@ -45,6 +46,16 @@ npm run dev
 
 The backend uses those files automatically when they exist. You can override the paths with `GTFS_PATH` / `PARK_RIDE_PATH`.
 
+## Real-time
+
+Real-time turns on automatically when `NJT_USERNAME` / `NJT_PASSWORD` are set and the real feed is loaded (never with sample data). It uses the same `GTFSG2` API as the schedule download:
+
+- **Trip updates**: per-stop predicted delays are applied to the schedule. A delay carries forward to later stops that have no prediction. Canceled trips are removed. The service day is worked out from each update's scheduled time, because NJT leaves `start_date` empty.
+- **Vehicle positions**: attached to bus legs and refreshed in the UI every 20 seconds.
+- **Alerts**: route-level alerts only, refreshed every 5 minutes. NJT's stop-only alerts are station signage greetings, so they're dropped.
+
+The API token is cached in `data/cache/njt_token.json` so restarts don't re-authenticate, and it is renewed automatically if NJT rejects it. `/api/health` reports feed status and errors. Set `REALTIME_ENABLED=false` to turn it off.
+
 ## How routing works
 
 - **Transit**: [RAPTOR](https://www.microsoft.com/en-us/research/publication/round-based-public-transit-routing/). Trips are grouped into stop patterns. Each round adds one more bus ride, and the router returns results that are best on arrival time versus number of transfers. After-midnight trips from the previous service day are included.
@@ -60,12 +71,13 @@ The backend uses those files automatically when they exist. You can override the
 | GET | `/api/geocode?q=` | Address search (Nominatim, NJ-biased) |
 | GET | `/api/reverse?lat=&lon=` | Reverse geocode |
 | GET | `/api/park-rides?lat=&lon=&radius_m=` | P&R lots near a point |
+| GET | `/api/vehicles?trip_id=&route_id=` | Live vehicle positions |
+| GET | `/api/alerts?route_id=` | Active route alerts |
 
 Interactive docs: <http://localhost:8000/docs>.
 
 ## Known limitations / next steps
 
-- Real-time data is not used yet. NJT's GTFS-RT feeds use the same developer credentials.
 - Each search uses a single departure time. There is no "arrive by" option yet.
 - Public Nominatim/OSRM/OSM tiles are for light use only. Self-host them for anything beyond development.
 - Map data © OpenStreetMap contributors (ODbL).

@@ -16,7 +16,9 @@ from .gtfs import load_timetable
 from .lots import load_lots
 from .osm import OSMClient
 from .planner import DriveEstimate, Planner
-from .schemas import GeocodeResult, Health, LotOut, PlanRequest, PlanResponse
+from .realtime import RealtimeClient
+from .schemas import (AlertOut, GeocodeResult, Health, LotOut, PlanRequest, PlanResponse, RealtimeStatus,
+                      VehicleOut)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("trip-planner")
@@ -32,8 +34,18 @@ async def lifespan(app: FastAPI):
         log.warning("Using the synthetic SAMPLE feed. Run scripts/fetch_gtfs.py for real NJ Transit data.")
     tt = await run_in_threadpool(load_timetable, gtfs, s.cache_dir, s.max_transfer_walk_m)
     lots = load_lots(s.resolved_park_ride_path)
-    state.update(settings=s, tt=tt, lots=lots, planner=Planner(tt, lots, s), osm=OSMClient(s))
+    planner = Planner(tt, lots, s)
+    rt = None
+    if s.realtime_active:
+        rt = RealtimeClient(s, tt)
+        planner.realtime_snapshot = lambda: rt.snapshot
+        rt.start()
+    else:
+        log.info("Realtime disabled (needs NJT credentials and the real NJ Transit feed)")
+    state.update(settings=s, tt=tt, lots=lots, planner=planner, osm=OSMClient(s), rt=rt)
     yield
+    if rt:
+        await rt.close()
     await state["osm"].close()
 
 
@@ -49,8 +61,49 @@ def health():
         status="ok", gtfs_path=str(s.resolved_gtfs_path), using_sample_data=s.using_sample,
         stops=tt.n_stops, routes=len(tt.routes), patterns=len(tt.patterns),
         trips=sum(len(p.trip_ids) for p in tt.patterns), feed_start=tt.feed_start, feed_end=tt.feed_end,
-        park_ride_lots=len(state["lots"]), use_osrm=s.use_osrm,
+        park_ride_lots=len(state["lots"]), use_osrm=s.use_osrm, realtime=_rt_status(),
     )
+
+
+def _rt_status() -> RealtimeStatus:
+    rt: RealtimeClient | None = state.get("rt")
+    if rt is None:
+        return RealtimeStatus(enabled=False)
+    snap = rt.snapshot
+    tz = ZoneInfo(state["settings"].timezone)
+    ts = lambda t: datetime.fromtimestamp(t, tz) if t else None  # noqa: E731
+    return RealtimeStatus(
+        enabled=True, last_update=ts(snap.fetched_at), feed_time=ts(snap.feed_time),
+        trips_with_predictions=len(snap.delays), canceled_trips=len(snap.canceled), vehicles=len(snap.vehicles),
+        alerts=len({a.id for alerts in snap.alerts_by_route.values() for a in alerts}), error=rt.error,
+    )
+
+
+@app.get("/api/vehicles", response_model=list[VehicleOut])
+def vehicles(trip_id: list[str] = Query(default=[]), route_id: list[str] = Query(default=[])):
+    """Live vehicle positions, filtered by trip and/or route ids (all vehicles if neither given)."""
+    rt: RealtimeClient | None = state.get("rt")
+    if rt is None:
+        return []
+    trips, routes = set(trip_id), set(route_id)
+    return [VehicleOut.from_vehicle(v) for v in rt.snapshot.vehicles.values()
+            if (not trips and not routes) or v.trip_id in trips or v.route_id in routes]
+
+
+@app.get("/api/alerts", response_model=list[AlertOut])
+def alerts(route_id: list[str] = Query(default=[])):
+    rt: RealtimeClient | None = state.get("rt")
+    if rt is None:
+        return []
+    snap = rt.snapshot
+    ids = route_id or list(snap.alerts_by_route)
+    seen, out = set(), []
+    for r in ids:
+        for a in snap.route_alerts(r):
+            if a.id not in seen:
+                seen.add(a.id)
+                out.append(AlertOut.from_alert(a))
+    return out
 
 
 @app.get("/api/geocode", response_model=list[GeocodeResult])

@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     njt_username: str | None = None
     njt_password: str | None = None
     njt_bus_api_base: str = "https://pcsdata.njtransit.com/api/GTFSG2"
+    # Realtime (needs the credentials above; disabled automatically with sample data)
+    realtime_enabled: bool = True
+    realtime_poll_s: int = 30
+    alerts_poll_s: int = 300
 
     # --- OpenStreetMap services (no keys required, but respect usage policies)
     user_agent: str = "nj-trip-planner/0.1 (local development)"
@@ -59,6 +63,10 @@ class Settings(BaseSettings):
     @property
     def using_sample(self) -> bool:
         return self.resolved_gtfs_path.resolve() == SAMPLE_GTFS.resolve()
+
+    @property
+    def realtime_active(self) -> bool:
+        return self.realtime_enabled and bool(self.njt_username and self.njt_password) and not self.using_sample
 
     @property
     def resolved_park_ride_path(self) -> Path | None:

@@ -44,6 +44,34 @@ class StopVisit(BaseModel):
     time: datetime
 
 
+class VehicleOut(BaseModel):
+    trip_id: str
+    route_id: str | None
+    lat: float
+    lon: float
+    bearing: float | None = None
+    timestamp: int | None = None
+    label: str | None = None
+    occupancy: str | None = None
+
+    @classmethod
+    def from_vehicle(cls, v) -> "VehicleOut":
+        return cls(trip_id=v.trip_id, route_id=v.route_id, lat=v.lat, lon=v.lon, bearing=v.bearing,
+                   timestamp=v.timestamp, label=v.label, occupancy=v.occupancy)
+
+
+class AlertOut(BaseModel):
+    id: str
+    header: str
+    description: str
+    url: str | None = None
+    route_ids: list[str]
+
+    @classmethod
+    def from_alert(cls, a) -> "AlertOut":
+        return cls(id=a.id, header=a.header, description=a.description, url=a.url, route_ids=list(a.route_ids))
+
+
 class Leg(BaseModel):
     mode: Literal["walk", "drive", "bus"]
     start: datetime
@@ -56,6 +84,13 @@ class Leg(BaseModel):
     headsign: str | None = None
     trip_id: str | None = None
     intermediate_stops: list[StopVisit] = []
+    # Realtime (bus legs only)
+    realtime: bool = False
+    scheduled_start: datetime | None = None
+    scheduled_end: datetime | None = None
+    delay_s: int | None = Field(None, description="Predicted minus scheduled departure; + is late")
+    vehicle: VehicleOut | None = None
+    alerts: list[AlertOut] = []
 
 
 class Itinerary(BaseModel):
@@ -92,6 +127,17 @@ class LotOut(BaseModel):
     distance_m: float
 
 
+class RealtimeStatus(BaseModel):
+    enabled: bool
+    last_update: datetime | None = None
+    feed_time: datetime | None = None
+    trips_with_predictions: int = 0
+    canceled_trips: int = 0
+    vehicles: int = 0
+    alerts: int = 0
+    error: str | None = None
+
+
 class Health(BaseModel):
     status: str
     gtfs_path: str
@@ -104,3 +150,4 @@ class Health(BaseModel):
     feed_end: date | None
     park_ride_lots: int
     use_osrm: bool
+    realtime: RealtimeStatus

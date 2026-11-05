@@ -9,6 +9,7 @@ the user sees the best options for each.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
@@ -18,7 +19,9 @@ from .config import Settings
 from .geo import PointIndex, haversine_m
 from .gtfs import Pattern, Timetable
 from .lots import ParkRideLot
-from .schemas import Itinerary, Leg, Place, PlanRequest, PlanResponse, RouteInfo, StopVisit
+from .realtime import Snapshot
+from .schemas import (AlertOut, Itinerary, Leg, Place, PlanRequest, PlanResponse, RouteInfo, StopVisit,
+                      VehicleOut)
 
 INF = 1 << 40
 DAY = 86400
@@ -73,30 +76,59 @@ class _Journey:
     arrival: int
 
 
-class DayView:
-    """Trips of each pattern that run on a service day, incl. yesterday's after-midnight trips."""
+@dataclass
+class PatternDay:
+    """A pattern's trips usable on one service day; times relative to that day's midnight."""
+    arr: np.ndarray  # (n, m) predicted (realtime) or scheduled
+    dep: np.ndarray
+    sched_arr: np.ndarray
+    sched_dep: np.ndarray
+    rows: np.ndarray  # (n,) row in Pattern arrays
+    live: np.ndarray  # (n,) bool: has realtime predictions
 
-    def __init__(self, tt: Timetable, day: date):
+
+class DayView:
+    """Trips of each pattern that run on a service day (incl. yesterday's after-midnight trips),
+    with realtime delays and cancellations applied when a snapshot covers that day."""
+
+    def __init__(self, tt: Timetable, day: date, rt: Snapshot | None = None):
         self.tt = tt
+        self.day = day
+        self.rt = rt if rt is not None and rt.applies_to(day) else None
         self.today = tt.active_services(day)
         self.yday = tt.active_services(day - timedelta(days=1))
-        self._cache: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._cache: dict[int, PatternDay] = {}
 
-    def trips(self, pi: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """(arr, dep, original trip row) for trips usable today, times relative to today's midnight."""
+    def trips(self, pi: int) -> PatternDay:
         hit = self._cache.get(pi)
         if hit is not None:
             return hit
         p = self.tt.patterns[pi]
         t_idx = np.flatnonzero(self.today[p.service_idx])
         y_idx = np.flatnonzero(self.yday[p.service_idx] & (p.arr[:, -1] >= DAY))
-        if len(y_idx):
-            arr = np.concatenate([p.arr[t_idx], p.arr[y_idx] - DAY]).astype(np.int64)
-            dep = np.concatenate([p.dep[t_idx], p.dep[y_idx] - DAY]).astype(np.int64)
-            rows = np.concatenate([t_idx, y_idx])
-        else:
-            arr, dep, rows = p.arr[t_idx].astype(np.int64), p.dep[t_idx].astype(np.int64), t_idx
-        self._cache[pi] = (arr, dep, rows)
+        rows = np.concatenate([t_idx, y_idx])
+        offs = np.concatenate([np.zeros(len(t_idx), np.int64), np.full(len(y_idx), -DAY, np.int64)])
+        rt = self.rt
+        if rt is not None and rt.canceled:
+            keep = np.array([p.trip_ids[r] not in rt.canceled for r in rows], dtype=bool)
+            rows, offs = rows[keep], offs[keep]
+        sched_arr = p.arr[rows].astype(np.int64) + offs[:, None]
+        sched_dep = p.dep[rows].astype(np.int64) + offs[:, None]
+        arr, dep = sched_arr, sched_dep
+        live = np.zeros(len(rows), dtype=bool)
+        if rt is not None and rt.delays:
+            yday = self.day - timedelta(days=1)
+            for i, (r, off) in enumerate(zip(rows.tolist(), offs.tolist())):
+                d = rt.delays.get((p.trip_ids[r], self.day if off == 0 else yday))
+                if d is None:
+                    continue
+                if not live.any():
+                    arr, dep = sched_arr.copy(), sched_dep.copy()
+                a = np.maximum.accumulate(sched_arr[i] + d.arr)
+                arr[i] = a
+                dep[i] = np.maximum.accumulate(np.maximum(sched_dep[i] + d.dep, a))
+                live[i] = True
+        self._cache[pi] = PatternDay(arr, dep, sched_arr, sched_dep, rows, live)
         return self._cache[pi]
 
 
@@ -107,16 +139,19 @@ class Planner:
         self.s = settings
         self.stop_index = PointIndex(tt.stop_lat, tt.stop_lon)
         self.lot_index = PointIndex([l.lat for l in lots], [l.lon for l in lots])
-        self._views: dict[date, DayView] = {}
+        self._views: dict[tuple[date, int], DayView] = {}
+        self.realtime_snapshot: Callable[[], Snapshot | None] = lambda: None
 
     # ------------------------------------------------------------- helpers
 
     def _view(self, day: date) -> DayView:
-        v = self._views.get(day)
+        snap = self.realtime_snapshot()
+        key = (day, snap.version if snap is not None and snap.applies_to(day) else -1)
+        v = self._views.get(key)
         if v is None:
             if len(self._views) > 8:
                 self._views.clear()
-            v = self._views[day] = DayView(self.tt, day)
+            v = self._views[key] = DayView(self.tt, day, snap)
         return v
 
     def walk_s(self, metres: float) -> int:
@@ -207,7 +242,8 @@ class Planner:
             improved: set[int] = set()
 
             for pi, pos0 in queue.items():
-                arr, dep, _ = view.trips(pi)
+                pd_ = view.trips(pi)
+                arr, dep = pd_.arr, pd_.dep
                 if len(dep) == 0:
                     continue
                 stops = tt.patterns[pi].stops
@@ -307,8 +343,7 @@ class Planner:
         legs: list[Leg] = []
         first = j.legs[0]
         assert isinstance(first, _BusLeg)
-        _, dep0, _ = view.trips(first.pattern)
-        board_t = int(dep0[first.trip, first.board_pos])
+        board_t = int(view.trips(first.pattern).dep[first.trip, first.board_pos])
         acc = j.access
         leave = board_t - acc.duration_s
         first_stop = self._stop_place(acc.stop)
@@ -335,8 +370,9 @@ class Planner:
             if isinstance(leg, _BusLeg):
                 n_bus += 1
                 p = tt.patterns[leg.pattern]
-                arr, dep, rows = view.trips(leg.pattern)
-                row = int(rows[leg.trip])
+                pdy = view.trips(leg.pattern)
+                arr, dep = pdy.arr, pdy.dep
+                row = int(pdy.rows[leg.trip])
                 r = tt.routes[p.route_idx]
                 stops = p.stops.tolist()
                 b, a = leg.board_pos, leg.alight_pos
@@ -347,13 +383,22 @@ class Planner:
                          for i in range(b + 1, a)]
                 dist = sum(haversine_m(tt.stop_lat[stops[i]], tt.stop_lon[stops[i]],
                                        tt.stop_lat[stops[i + 1]], tt.stop_lon[stops[i + 1]]) for i in range(b, a))
+                trip_id = p.trip_ids[row]
+                live = bool(pdy.live[leg.trip])
+                snap = view.rt
+                veh = snap.vehicles.get(trip_id) if snap is not None and (live or view.day == snap.today) else None
                 legs.append(Leg(
                     mode="bus", start=ts(t_b), end=ts(t_a),
                     from_place=self._stop_place(stops[b]), to_place=self._stop_place(stops[a]),
                     distance_m=dist, geometry=self._bus_geometry(p, b, a),
                     route=RouteInfo(id=r.route_id, short_name=r.short_name, long_name=r.long_name,
                                     color=r.color, text_color=r.text_color),
-                    headsign=p.headsigns[row] or None, trip_id=p.trip_ids[row], intermediate_stops=inter,
+                    headsign=p.headsigns[row] or None, trip_id=trip_id, intermediate_stops=inter,
+                    realtime=live,
+                    scheduled_start=ts(pdy.sched_dep[leg.trip, b]), scheduled_end=ts(pdy.sched_arr[leg.trip, a]),
+                    delay_s=t_b - int(pdy.sched_dep[leg.trip, b]) if live else None,
+                    vehicle=VehicleOut.from_vehicle(veh) if veh else None,
+                    alerts=[AlertOut.from_alert(al) for al in snap.route_alerts(r.route_id)] if snap else [],
                 ))
             else:
                 walk_m += leg.dist_m
@@ -390,10 +435,10 @@ class Planner:
             next_t = INF
             for j in journeys:
                 bus = [l for l in j.legs if isinstance(l, _BusLeg)]
-                _, dep, rows = view.trips(bus[0].pattern)
+                dep = view.trips(bus[0].pattern).dep
                 leave = int(dep[bus[0].trip, bus[0].board_pos]) - j.access.duration_s
                 next_t = min(next_t, leave + 60)
-                key = tuple((l.pattern, int(view.trips(l.pattern)[2][l.trip])) for l in bus)
+                key = tuple((l.pattern, int(view.trips(l.pattern).rows[l.trip])) for l in bus)
                 if key not in seen:
                     seen.add(key)
                     out.append(self._to_itinerary(view, j, midnight, origin, dest))

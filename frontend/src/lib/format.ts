@@ -29,3 +29,17 @@ export function shortName(name: string): string {
 }
 
 export const LEG_COLORS = { walk: "#475569", drive: "#7c3aed" } as const;
+
+/** "On time" / "3 min late" / "2 min early" from a delay in seconds. */
+export function formatDelay(s: number): { text: string; tone: "ok" | "late" | "early" } {
+  const m = Math.round(s / 60);
+  if (m === 0) return { text: "On time", tone: "ok" };
+  if (m > 0) return { text: `${m} min late`, tone: "late" };
+  return { text: `${-m} min early`, tone: "early" };
+}
+
+export function formatAgo(epochS: number | null, now = Date.now()): string {
+  if (!epochS) return "";
+  const s = Math.max(0, Math.round(now / 1000 - epochS));
+  return s < 60 ? `${s}s ago` : `${Math.round(s / 60)} min ago`;
+}

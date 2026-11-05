@@ -1,6 +1,6 @@
 import { Fragment } from "react";
-import { formatDistance, formatDuration, formatTime, shortName } from "../lib/format";
-import type { Itinerary, Leg } from "../lib/types";
+import { formatAgo, formatDelay, formatDistance, formatDuration, formatTime, shortName } from "../lib/format";
+import type { Itinerary, Leg, Vehicle } from "../lib/types";
 import { BusIcon, CarIcon, WalkIcon } from "./Icons";
 
 const MODE_LABEL = { walk: "Walk", park_ride: "Park & Ride", walk_only: "Walk only" } as const;
@@ -16,6 +16,48 @@ function RouteBadge({ leg }: { leg: Leg }) {
   );
 }
 
+const TONE = { ok: "text-emerald-700", late: "text-red-600", early: "text-amber-600" } as const;
+
+function LiveBadge({ leg }: { leg: Leg }) {
+  if (!leg.realtime || leg.delay_s == null) return null;
+  const d = formatDelay(leg.delay_s);
+  return (
+    <span className={`inline-flex items-center gap-1 text-xs font-medium ${TONE[d.tone]}`} title="Live prediction">
+      <span className="relative flex h-2 w-2">
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-current opacity-60" />
+        <span className="relative inline-flex h-2 w-2 rounded-full bg-current" />
+      </span>
+      {d.text}
+    </span>
+  );
+}
+
+/** Live time, with the scheduled time struck through when they differ by a minute or more. */
+function LiveTime({ time, scheduled }: { time: string; scheduled: string | null }) {
+  const off = scheduled ? Math.abs(Date.parse(time) - Date.parse(scheduled)) >= 60000 : false;
+  return (
+    <span className="tabular-nums">
+      <span className="font-medium">{formatTime(time)}</span>
+      {off && <span className="ml-1 text-xs text-slate-400 line-through">{formatTime(scheduled!)}</span>}
+    </span>
+  );
+}
+
+function AlertList({ leg }: { leg: Leg }) {
+  if (!leg.alerts.length) return null;
+  return (
+    <div className="mt-1 space-y-1">
+      {leg.alerts.map((a) => (
+        <details key={a.id} className="rounded-md bg-amber-50 px-2 py-1 text-xs text-amber-900">
+          <summary className="cursor-pointer select-none font-medium">⚠ {a.header || "Service alert"}</summary>
+          {a.description && a.description !== a.header && <p className="mt-1 whitespace-pre-line">{a.description}</p>}
+          {a.url && <a href={a.url} target="_blank" rel="noreferrer" className="underline">More info</a>}
+        </details>
+      ))}
+    </div>
+  );
+}
+
 function LegChip({ leg }: { leg: Leg }) {
   if (leg.mode === "bus") return <RouteBadge leg={leg} />;
   const Icon = leg.mode === "drive" ? CarIcon : WalkIcon;
@@ -28,7 +70,7 @@ function LegChip({ leg }: { leg: Leg }) {
   );
 }
 
-function LegDetail({ leg }: { leg: Leg }) {
+function LegDetail({ leg, vehicle }: { leg: Leg; vehicle: Vehicle | null }) {
   const dur = formatDuration((Date.parse(leg.end) - Date.parse(leg.start)) / 1000);
   if (leg.mode === "bus") {
     const r = leg.route!;
@@ -36,10 +78,18 @@ function LegDetail({ leg }: { leg: Leg }) {
       <div className="border-l-4 py-1 pl-3" style={{ borderColor: r.color }}>
         <div className="flex items-center gap-2">
           <RouteBadge leg={leg} />
-          <span className="truncate text-sm text-slate-700">{leg.headsign || r.long_name}</span>
+          <span className="min-w-0 flex-1 truncate text-sm text-slate-700">{leg.headsign || r.long_name}</span>
+          <LiveBadge leg={leg} />
         </div>
+        {vehicle && (
+          <p className="mt-0.5 text-xs text-slate-500">
+            Bus {vehicle.label ?? ""}{vehicle.occupancy ? ` · ${vehicle.occupancy}` : ""}
+            {vehicle.timestamp ? ` · seen ${formatAgo(vehicle.timestamp)}` : ""}
+          </p>
+        )}
+        <AlertList leg={leg} />
         <p className="mt-1 text-sm">
-          <span className="font-medium tabular-nums">{formatTime(leg.start)}</span> Board at {leg.from_place.name}
+          <LiveTime time={leg.start} scheduled={leg.scheduled_start} /> Board at {leg.from_place.name}
         </p>
         <details className="text-xs text-slate-500">
           <summary className="cursor-pointer select-none py-0.5">
@@ -52,7 +102,7 @@ function LegDetail({ leg }: { leg: Leg }) {
           </ul>
         </details>
         <p className="text-sm">
-          <span className="font-medium tabular-nums">{formatTime(leg.end)}</span> Get off at {leg.to_place.name}
+          <LiveTime time={leg.end} scheduled={leg.scheduled_end} /> Get off at {leg.to_place.name}
         </p>
       </div>
     );
@@ -76,13 +126,16 @@ interface Props {
   itineraries: Itinerary[];
   selected: number;
   onSelect: (i: number) => void;
+  vehicles: Record<string, Vehicle>;
 }
 
-export default function ItineraryList({ itineraries, selected, onSelect }: Props) {
+export default function ItineraryList({ itineraries, selected, onSelect, vehicles }: Props) {
   return (
     <ul className="space-y-2">
       {itineraries.map((it, i) => {
         const active = i === selected;
+        const firstBus = it.legs.find((l) => l.mode === "bus");
+        const alertCount = it.legs.reduce((n, l) => n + l.alerts.length, 0);
         return (
           <li key={i}>
             <div
@@ -119,12 +172,24 @@ export default function ItineraryList({ itineraries, selected, onSelect }: Props
                 {it.drive_m > 0 && <span>{formatDistance(it.drive_m)} drive</span>}
                 {it.wait_s >= 60 && <span>{formatDuration(it.wait_s)} waiting</span>}
               </div>
+              {(firstBus?.realtime || alertCount > 0) && (
+                <div className="mt-1 flex items-center gap-3">
+                  {firstBus && <LiveBadge leg={firstBus} />}
+                  {alertCount > 0 && (
+                    <span className="text-xs font-medium text-amber-700">
+                      ⚠ {alertCount} alert{alertCount > 1 ? "s" : ""}
+                    </span>
+                  )}
+                </div>
+              )}
               {active && (
                 <div className="mt-3 space-y-2 border-t border-slate-100 pt-3">
                   {it.park_ride_lot && (
                     <p className="text-xs text-violet-700">Park at <span className="font-medium">{it.park_ride_lot}</span></p>
                   )}
-                  {it.legs.map((l, j) => <LegDetail key={j} leg={l} />)}
+                  {it.legs.map((l, j) => (
+                    <LegDetail key={j} leg={l} vehicle={(l.trip_id && vehicles[l.trip_id]) || l.vehicle} />
+                  ))}
                   <p className="text-sm"><span className="font-medium tabular-nums">{formatTime(it.end)}</span> Arrive</p>
                 </div>
               )}

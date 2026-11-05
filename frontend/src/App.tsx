@@ -1,12 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import ItineraryList from "./components/ItineraryList";
 import LocationSearch from "./components/LocationSearch";
 import MapView from "./components/MapView";
 import PlanOptions, { type Options } from "./components/PlanOptions";
 import { BusIcon, SwapIcon } from "./components/Icons";
 import { api } from "./lib/api";
-import { miToM } from "./lib/format";
-import type { Health, Lot, Place, PlanResponse } from "./lib/types";
+import { formatTime, miToM } from "./lib/format";
+import type { Health, Lot, Place, PlanResponse, RouteInfo, Vehicle } from "./lib/types";
 
 const DEFAULT_OPTIONS: Options = {
   departAt: "",
@@ -29,6 +29,26 @@ function loadOptions(): Options {
 
 type Target = "origin" | "destination";
 
+const VEHICLE_POLL_MS = 20000;
+const HEALTH_POLL_MS = 30000;
+
+function LiveStatus({ health }: { health: Health | null }) {
+  const rt = health?.realtime;
+  if (!rt) return null;
+  if (!rt.enabled)
+    return <span className="text-xs text-slate-400" title="Add NJ Transit credentials for live data">Schedule only</span>;
+  const ok = !rt.error && rt.last_update;
+  const title = rt.error
+    ? `Live data error: ${rt.error}`
+    : `${rt.vehicles} buses tracked · ${rt.trips_with_predictions} trips with predictions · ${rt.alerts} alerts`;
+  return (
+    <span className={`flex items-center gap-1.5 text-xs ${ok ? "text-emerald-700" : "text-amber-700"}`} title={title}>
+      <span className={`h-2 w-2 rounded-full ${ok ? "bg-emerald-500" : "bg-amber-500"}`} />
+      {ok ? `Live · ${formatTime(rt.last_update!)}` : rt.last_update ? "Live data delayed" : "Connecting…"}
+    </span>
+  );
+}
+
 export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [backendDown, setBackendDown] = useState(false);
@@ -41,9 +61,21 @@ export default function App() {
   const [selected, setSelected] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [vehicles, setVehicles] = useState<Record<string, Vehicle>>({});
+  const [plannedAt, setPlannedAt] = useState<Date | null>(null);
 
   useEffect(() => {
-    api.health().then(setHealth).catch(() => setBackendDown(true));
+    const load = () =>
+      api
+        .health()
+        .then((h) => {
+          setHealth(h);
+          setBackendDown(false);
+        })
+        .catch(() => setBackendDown(true));
+    load();
+    const t = setInterval(load, HEALTH_POLL_MS);
+    return () => clearInterval(t);
   }, []);
 
   useEffect(() => {
@@ -87,7 +119,7 @@ export default function App() {
 
   const canPlan = origin && destination && (options.walkAccess || options.parkRide) && !loading;
 
-  const plan = async () => {
+  const plan = async (keepSelection = false) => {
     if (!origin || !destination) return;
     setLoading(true);
     setError(null);
@@ -104,7 +136,8 @@ export default function App() {
         num_itineraries: 3,
       });
       setResult(res);
-      setSelected(0);
+      setPlannedAt(new Date());
+      setSelected((s) => (keepSelection && s < res.itineraries.length ? s : 0));
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -114,6 +147,29 @@ export default function App() {
 
   const itinerary = result?.itineraries[selected] ?? null;
 
+  // Poll live positions of the buses in the selected itinerary.
+  const busLegs = useMemo(() => itinerary?.legs.filter((l) => l.mode === "bus" && l.trip_id) ?? [], [itinerary]);
+  const tripKey = busLegs.map((l) => l.trip_id).join(",");
+  const realtimeOn = !!health?.realtime.enabled;
+  useEffect(() => {
+    setVehicles({});
+    if (!realtimeOn || !tripKey) return;
+    const ids = tripKey.split(",");
+    const load = () =>
+      api
+        .vehicles(ids)
+        .then((vs) => setVehicles(Object.fromEntries(vs.map((v) => [v.trip_id, v]))))
+        .catch(() => {});
+    load();
+    const t = setInterval(load, VEHICLE_POLL_MS);
+    return () => clearInterval(t);
+  }, [tripKey, realtimeOn]);
+
+  const liveBuses = busLegs.flatMap((l) => {
+    const v = vehicles[l.trip_id!] ?? l.vehicle;
+    return v ? [{ vehicle: v, route: l.route as RouteInfo }] : [];
+  });
+
   return (
     <div className={`flex h-full flex-col-reverse bg-slate-50 text-slate-900 md:flex-row ${picking ? "picking" : ""}`}>
       <aside className="flex h-[55%] w-full flex-col border-slate-200 bg-white md:h-full md:w-[400px] md:border-r">
@@ -122,6 +178,9 @@ export default function App() {
           <div>
             <h1 className="text-base font-semibold leading-tight">NJ Bus Trip Planner</h1>
             <p className="text-xs text-slate-500">NJ Transit buses + OpenStreetMap</p>
+          </div>
+          <div className="ml-auto">
+            <LiveStatus health={health} />
           </div>
         </header>
 
@@ -158,7 +217,7 @@ export default function App() {
           <PlanOptions value={options} onChange={setOptions} />
 
           <button
-            onClick={plan}
+            onClick={() => plan()}
             disabled={!canPlan}
             className="w-full rounded-xl bg-blue-600 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -175,7 +234,23 @@ export default function App() {
                 <p key={i} className="rounded-lg bg-slate-100 p-2.5 text-xs text-slate-600">{n}</p>
               ))}
               {result.itineraries.length > 0 && (
-                <ItineraryList itineraries={result.itineraries} selected={selected} onSelect={setSelected} />
+                <>
+                  <div className="flex items-center justify-between text-xs text-slate-500">
+                    <span>
+                      {realtimeOn ? "Times include live predictions" : "Scheduled times"}
+                      {plannedAt && ` · as of ${plannedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`}
+                    </span>
+                    <button
+                      onClick={() => plan(true)}
+                      disabled={loading}
+                      className="rounded-md px-2 py-1 font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-50"
+                    >
+                      ↻ Refresh
+                    </button>
+                  </div>
+                  <ItineraryList itineraries={result.itineraries} selected={selected} onSelect={setSelected}
+                    vehicles={vehicles} />
+                </>
               )}
             </section>
           )}
@@ -191,6 +266,7 @@ export default function App() {
           lots={lots}
           itinerary={itinerary}
           onMapClick={onMapClick}
+          liveBuses={liveBuses}
         />
       </main>
     </div>
