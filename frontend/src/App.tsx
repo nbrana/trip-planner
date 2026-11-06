@@ -35,12 +35,32 @@ type Target = "origin" | "destination";
 const VEHICLE_POLL_MS = 20000;
 const HEALTH_POLL_MS = 30000;
 
+/** Warn when the static schedule is about to run out (or has). */
+function ScheduleBanner({ health }: { health: Health | null }) {
+  if (!health?.feed_end || health.using_sample_data) return null;
+  const end = new Date(`${health.feed_end}T23:59:59`);
+  const days = Math.floor((end.getTime() - Date.now()) / 86400e3);
+  if (days > 2) return null;
+  const endText = end.toLocaleDateString([], { month: "short", day: "numeric" });
+  const fix = health.schedule.auto_download
+    ? health.schedule.error
+      ? `Automatic update failed: ${health.schedule.error}`
+      : "It updates automatically; check back soon."
+    : "Run scripts/fetch_gtfs.py to download a new one.";
+  return (
+    <div className={`rounded-lg border p-3 text-xs ${days < 0 ? "border-red-200 bg-red-50 text-red-700" : "border-amber-200 bg-amber-50 text-amber-800"}`}>
+      {days < 0 ? <>Bus schedule data <strong>expired on {endText}</strong>. </> : <>Bus schedule data ends <strong>{endText}</strong>. </>}
+      {fix}
+    </div>
+  );
+}
+
 function LiveStatus({ health }: { health: Health | null }) {
   const rt = health?.realtime;
   if (!rt) return null;
   if (!rt.enabled)
     return <span className="text-xs text-slate-400" title="Add NJ Transit credentials for live data">Schedule only</span>;
-  const ok = !rt.error && rt.last_update;
+  const ok = !rt.error && rt.last_update && !rt.stale;
   const title = rt.error
     ? `Live data error: ${rt.error}`
     : `${rt.vehicles} buses tracked · ${rt.trips_with_predictions} trips with predictions · ${rt.alerts} alerts`;
@@ -200,6 +220,7 @@ export default function App() {
               Can't reach the backend. Start it with <code>uv run uvicorn app.main:app --reload</code> in <code>backend/</code>.
             </div>
           )}
+          <ScheduleBanner health={health} />
           {health?.using_sample_data && (
             <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
               Using <strong>synthetic sample data</strong> (routes S1–S3 near Montclair/Bloomfield). Add NJ Transit

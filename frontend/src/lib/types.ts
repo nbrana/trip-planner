@@ -61,6 +61,7 @@ export interface Alert {
 
 export interface RealtimeStatus {
   enabled: boolean;
+  stale: boolean;
   last_update: string | null;
   feed_time: string | null;
   trips_with_predictions: number;
@@ -121,4 +122,11 @@ export interface Health {
   park_ride_lots: number;
   use_osrm: boolean;
   realtime: RealtimeStatus;
+  water_data: boolean;
+  schedule: {
+    auto_download: boolean;
+    last_download: string | null;
+    last_reload: string | null;
+    error: string | null;
+  };
 }

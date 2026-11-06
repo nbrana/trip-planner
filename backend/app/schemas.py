@@ -136,12 +136,20 @@ class LotOut(BaseModel):
 
 class RealtimeStatus(BaseModel):
     enabled: bool
+    stale: bool = False
     last_update: datetime | None = None
     feed_time: datetime | None = None
     trips_with_predictions: int = 0
     canceled_trips: int = 0
     vehicles: int = 0
     alerts: int = 0
+    error: str | None = None
+
+
+class ScheduleStatus(BaseModel):
+    auto_download: bool
+    last_download: datetime | None = None
+    last_reload: datetime | None = None
     error: str | None = None
 
 
@@ -158,3 +166,5 @@ class Health(BaseModel):
     park_ride_lots: int
     use_osrm: bool
     realtime: RealtimeStatus
+    water_data: bool
+    schedule: ScheduleStatus

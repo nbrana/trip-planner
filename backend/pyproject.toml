@@ -13,6 +13,7 @@ dependencies = [
     "pydantic-settings>=2.3",
     "tzdata",
     "gtfs-realtime-bindings>=3.0.0",
+    "shapely>=2.2.0",
 ]
 
 [dependency-groups]

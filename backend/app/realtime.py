@@ -8,20 +8,18 @@ predicted times.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-import httpx
 import numpy as np
-from google.protobuf.message import DecodeError
 from google.transit import gtfs_realtime_pb2 as pb
 
 from .config import Settings
 from .gtfs import Timetable
+from .njt import NJTClient
 
 log = logging.getLogger(__name__)
 
@@ -72,9 +70,21 @@ class Snapshot:
     alerts_by_route: dict[str, list[Alert]] = field(default_factory=dict)
     feed_time: int | None = None
     fetched_at: float | None = None
+    expires_at: float | None = None  # after this, the data is too old to trust
+
+    @property
+    def stale(self) -> bool:
+        return self.expires_at is not None and time.time() > self.expires_at
 
     def applies_to(self, day: date) -> bool:
-        return self.today is not None and abs((day - self.today).days) <= 1
+        return self.today is not None and not self.stale and abs((day - self.today).days) <= 1
+
+    def is_canceled(self, trip_id: str, service_day: date, overnight: bool) -> bool:
+        """NJT's cancellations carry no date: they refer to trips running now, i.e. today's service
+        or, for a trip still running after midnight, yesterday's."""
+        if trip_id not in self.canceled or self.today is None:
+            return False
+        return service_day == self.today or (overnight and (self.today - service_day).days == 1)
 
     def route_alerts(self, route_id: str, now: float | None = None) -> list[Alert]:
         now = time.time() if now is None else now
@@ -214,22 +224,20 @@ def parse_alerts(msg: pb.FeedMessage) -> dict[str, list[Alert]]:
 
 
 class RealtimeClient:
-    def __init__(self, settings: Settings, tt: Timetable):
+    def __init__(self, settings: Settings, tt: Timetable, njt: NJTClient):
         self.s = settings
-        self.tt = tt
         self.tz = ZoneInfo(settings.timezone)
-        self.index = build_trip_index(tt)
+        self.njt = njt
+        self.set_timetable(tt)
         self.snapshot = Snapshot()
         self.error: str | None = None
-        self._token: str | None = None
-        self._token_file = settings.cache_dir / "njt_token.json"
         self._alerts_at = 0.0
-        self._http = httpx.AsyncClient(timeout=30, headers={"User-Agent": settings.user_agent})
         self._task: asyncio.Task | None = None
 
-    @property
-    def base(self) -> str:
-        return self.s.njt_bus_api_base.rstrip("/")
+    def set_timetable(self, tt: Timetable) -> None:
+        """Called when the schedule is reloaded; the next refresh maps updates onto it."""
+        self.tt = tt
+        self.index = build_trip_index(tt)
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run())
@@ -237,60 +245,22 @@ class RealtimeClient:
     async def close(self) -> None:
         if self._task:
             self._task.cancel()
-        await self._http.aclose()
-
-    # NJT limits authentication calls, so the token is reused and cached on disk.
-    def _load_token(self) -> str | None:
-        try:
-            data = json.loads(self._token_file.read_text())
-            return data["token"] if data.get("base") == self.base else None
-        except (OSError, ValueError, KeyError):
-            return None
-
-    async def _authenticate(self) -> str:
-        r = await self._http.post(f"{self.base}/authenticateUser",
-                                  files={"username": (None, self.s.njt_username), "password": (None, self.s.njt_password)})
-        r.raise_for_status()
-        body = r.json()
-        token = body.get("UserToken")
-        if not token or str(body.get("Authenticated", "")).lower() != "true":
-            raise RuntimeError(f"NJ Transit authentication failed: {body.get('errorMessage') or body}")
-        self._token_file.parent.mkdir(parents=True, exist_ok=True)
-        self._token_file.write_text(json.dumps({"base": self.base, "token": token}))
-        log.info("Authenticated with NJ Transit realtime API")
-        return token
-
-    async def _feed(self, endpoint: str) -> pb.FeedMessage:
-        for attempt in range(2):
-            if self._token is None:
-                self._token = self._load_token() if attempt == 0 else None
-                if self._token is None:
-                    self._token = await self._authenticate()
-            r = await self._http.post(f"{self.base}/{endpoint}", files={"token": (None, self._token)})
-            content = r.content
-            if r.is_success and not content.lstrip()[:1] in (b"{", b"<", b"["):
-                msg = pb.FeedMessage()
-                try:
-                    msg.ParseFromString(content)
-                    return msg
-                except DecodeError:
-                    pass
-            log.info("%s rejected (HTTP %s); re-authenticating", endpoint, r.status_code)
-            self._token = None
-        raise RuntimeError(f"{endpoint}: could not fetch a valid feed (HTTP {r.status_code}): {r.text[:200]}")
 
     async def refresh(self) -> None:
-        trips_msg = await self._feed("getTripUpdates")
-        veh_msg = await self._feed("getVehiclePositions")
+        trips_msg = await self.njt.feed("getTripUpdates")
+        veh_msg = await self.njt.feed("getVehiclePositions")
         alerts = self.snapshot.alerts_by_route
         if time.monotonic() - self._alerts_at >= self.s.alerts_poll_s:
-            alerts = parse_alerts(await self._feed("getAlerts"))
+            alerts = parse_alerts(await self.njt.feed("getAlerts"))
             self._alerts_at = time.monotonic()
-        delays, canceled = await asyncio.to_thread(parse_trip_updates, self.tt, self.index, trips_msg, self.tz)
+        tt, index = self.tt, self.index
+        delays, canceled = await asyncio.to_thread(parse_trip_updates, tt, index, trips_msg, self.tz)
+        now = time.time()
         self.snapshot = Snapshot(
             version=self.snapshot.version + 1, today=datetime.now(self.tz).date(),
             delays=delays, canceled=canceled, vehicles=parse_vehicles(veh_msg), alerts_by_route=alerts,
-            feed_time=trips_msg.header.timestamp or None, fetched_at=time.time(),
+            feed_time=trips_msg.header.timestamp or None, fetched_at=now,
+            expires_at=now + self.s.realtime_max_age_s,
         )
         self.error = None
 

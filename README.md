@@ -41,8 +41,16 @@ npm run dev
    ```bash
    uv run python scripts/fetch_park_rides.py  # -> data/park_rides.json
    ```
-3. **Set `USER_AGENT`** in `.env` to something that identifies you. Nominatim's usage policy requires this.
-4. **Restart the backend.** The first load parses the feed (this can take a minute for the full NJT bus feed). After that, a pickle cache in `data/cache/` makes startup fast.
+3. **Water data** (from OpenStreetMap, no key needed; takes a few minutes). This stops walks being planned across the Hudson, Newark Bay and similar:
+   ```bash
+   uv run python scripts/fetch_water.py       # -> data/water.json.gz
+   ```
+4. **Set `USER_AGENT`** in `.env` to something that identifies you. Nominatim's usage policy requires this.
+5. **Restart the backend.** The first load parses the feed (this can take a minute for the full NJT bus feed). After that, a pickle cache in `data/cache/` makes startup fast.
+
+### Keeping the schedule current
+
+NJ Transit's feed only covers about two weeks. With credentials set, the backend downloads a fresh feed every `GTFS_REFRESH_HOURS` (default 24). It reloads the timetable whenever `data/njt_bus_gtfs.zip` changes, including manual downloads, and needs no restart. The app shows a warning when the schedule is within 2 days of running out.
 
 The backend uses those files automatically when they exist. You can override the paths with `GTFS_PATH` / `PARK_RIDE_PATH`.
 
@@ -54,13 +62,16 @@ Real-time turns on automatically when `NJT_USERNAME` / `NJT_PASSWORD` are set an
 - **Vehicle positions**: attached to bus legs and refreshed in the UI every 20 seconds.
 - **Alerts**: route-level alerts only, refreshed every 5 minutes. NJT's stop-only alerts are station signage greetings, so they're dropped.
 
+- **Freshness**: live data older than `REALTIME_MAX_AGE_S` (default 5 minutes, e.g. during a feed outage) is ignored, and plans fall back to the schedule with a note. NJT's cancellations carry no date, so they only apply to trips running today (or a late trip from yesterday still running after midnight).
+
 The API token is cached in `data/cache/njt_token.json` so restarts don't re-authenticate, and it is renewed automatically if NJT rejects it. `/api/health` reports feed status and errors. Set `REALTIME_ENABLED=false` to turn it off.
 
 ## How routing works
 
 - **Transit**: [RAPTOR](https://www.microsoft.com/en-us/research/publication/round-based-public-transit-routing/). Trips are grouped into stop patterns. Each round adds one more bus ride, and the router returns results that are best on arrival time versus number of transfers. After-midnight trips from the previous service day are included.
-- **Walk and drive legs** are estimated from straight-line distance × a detour factor ÷ speed (all configurable in `.env`). Set `USE_OSRM=true` to use the public OSRM servers instead. Drive times then come from real roads, and walk and drive legs follow the actual streets on the map.
+- **Walk and drive legs** are estimated from straight-line distance × a detour factor ÷ speed (all configurable in `.env`). A walk whose straight line crosses more than `MAX_WALK_WATER_M` (400 m) of water is rejected. Wide water like the Hudson, Newark Bay and the Delaware at Camden is ruled out, while rivers you can cross on a footbridge, like the Passaic and Hackensack, stay allowed. Water comes from OSM coastlines (the tidal rivers and bays are "sea" in OSM) plus lake/river polygons. Set `USE_OSRM=true` to use the public OSRM servers instead. Drive times then come from real roads, and walk and drive legs follow the actual streets on the map.
 - **Arrive by**: the same RAPTOR runs on a time-reversed view of the timetable (stop order reversed, times negated). That finds the *latest* departure that still arrives by the deadline, and the result is converted back to forward order. Live delays apply the same way.
+- **Day boundaries**: if a service day runs out of trips, the search continues into the next day's schedule (or the previous day's, for arrive-by). Leaving at 11:58 PM can return tomorrow morning's first bus.
 - **Multiple options**: the search re-runs just after each found departure (or, for arrive-by, with a deadline just before each found arrival) to get more options. Options another option matches or beats on leave time, arrival and transfers are dropped.
 
 ## API

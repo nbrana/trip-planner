@@ -20,6 +20,7 @@ from .geo import PointIndex, haversine_m
 from .gtfs import Pattern, Timetable
 from .lots import ParkRideLot
 from .realtime import Snapshot
+from .water import WaterIndex
 from .schemas import (AlertOut, Itinerary, Leg, Place, PlanRequest, PlanResponse, RouteInfo, StopVisit,
                       VehicleOut)
 
@@ -84,6 +85,7 @@ class PatternDay:
     sched_arr: np.ndarray
     sched_dep: np.ndarray
     rows: np.ndarray  # (n,) row in Pattern arrays
+    svc_offset: np.ndarray  # (n,) 0 = this day's service, -1 = previous day's (after-midnight trip)
     live: np.ndarray  # (n,) bool: has realtime predictions
 
 
@@ -110,7 +112,11 @@ class DayView:
         offs = np.concatenate([np.zeros(len(t_idx), np.int64), np.full(len(y_idx), -DAY, np.int64)])
         rt = self.rt
         if rt is not None and rt.canceled:
-            keep = np.array([p.trip_ids[r] not in rt.canceled for r in rows], dtype=bool)
+            yday = self.day - timedelta(days=1)
+            keep = np.array([
+                not rt.is_canceled(p.trip_ids[r], self.day if off == 0 else yday, bool(p.arr[r, -1] >= DAY))
+                for r, off in zip(rows.tolist(), offs.tolist())
+            ], dtype=bool)
             rows, offs = rows[keep], offs[keep]
         sched_arr = p.arr[rows].astype(np.int64) + offs[:, None]
         sched_dep = p.dep[rows].astype(np.int64) + offs[:, None]
@@ -128,7 +134,7 @@ class DayView:
                 arr[i] = a
                 dep[i] = np.maximum.accumulate(np.maximum(sched_dep[i] + d.dep, a))
                 live[i] = True
-        self._cache[pi] = PatternDay(arr, dep, sched_arr, sched_dep, rows, live)
+        self._cache[pi] = PatternDay(arr, dep, sched_arr, sched_dep, rows, offs // DAY, live)
         return self._cache[pi]
 
 
@@ -171,10 +177,11 @@ class _Direction:
 
 
 class Planner:
-    def __init__(self, tt: Timetable, lots: list[ParkRideLot], settings: Settings):
+    def __init__(self, tt: Timetable, lots: list[ParkRideLot], settings: Settings, water: WaterIndex | None = None):
         self.tt = tt
         self.lots = lots
         self.s = settings
+        self.water = water
         self.stop_index = PointIndex(tt.stop_lat, tt.stop_lon)
         self.lot_index = PointIndex([l.lat for l in lots], [l.lon for l in lots])
         self._views: dict[tuple[date, int], DayView] = {}
@@ -209,11 +216,18 @@ class Planner:
 
     # -------------------------------------------------------- access/egress
 
+    def walkable(self, lat1: float, lon1: float, lat2: float, lon2: float) -> bool:
+        """False if the straight walking line crosses wide water (a river or bay with no footbridge)."""
+        return self.water is None or self.water.water_m(lat1, lon1, lat2, lon2) <= self.s.max_walk_water_m
+
+    def _walkable_stop(self, lat: float, lon: float, s: int) -> bool:
+        return self.walkable(lat, lon, float(self.tt.stop_lat[s]), float(self.tt.stop_lon[s]))
+
     def walk_access(self, lat: float, lon: float, max_walk_m: float) -> dict[int, AccessOption]:
         idx, d = self.stop_index.within(lat, lon, max_walk_m / self.s.walk_detour)
         out = {}
         for s, dist in zip(idx.tolist(), d.tolist()):
-            if self.tt.stop_patterns[s]:
+            if self.tt.stop_patterns[s] and self._walkable_stop(lat, lon, s):
                 m = dist * self.s.walk_detour
                 out[s] = AccessOption(s, self.walk_s(m), "walk", m)
         return out
@@ -227,7 +241,7 @@ class Planner:
                 continue
             sidx, sd = self.stop_index.within(lot.lat, lot.lon, self.s.park_ride_walk_m / self.s.walk_detour)
             for s, dist in zip(sidx.tolist(), sd.tolist()):
-                if not self.tt.stop_patterns[s]:
+                if not self.tt.stop_patterns[s] or not self._walkable_stop(lot.lat, lot.lon, s):
                     continue
                 wm = dist * self.s.walk_detour
                 dur = est.duration_s + self.s.park_buffer_s + self.walk_s(wm)
@@ -240,7 +254,7 @@ class Planner:
         idx, d = self.stop_index.within(lat, lon, max_walk_m / self.s.walk_detour)
         out = {}
         for s, dist in zip(idx.tolist(), d.tolist()):
-            if self.tt.stop_patterns[s]:
+            if self.tt.stop_patterns[s] and self._walkable_stop(lat, lon, s):
                 m = dist * self.s.walk_detour
                 out[s] = EgressOption(s, self.walk_s(m), m)
         return out
@@ -476,38 +490,50 @@ class Planner:
         arrival = int(view.trips(last.pattern).arr[last.trip, last.alight_pos]) + egress.duration_s
         return _Journey(j.egress, legs, egress, arrival)
 
-    def _search(self, view: DayView, access, egress, t: int, req: PlanRequest,
-                midnight: datetime, origin: Place, dest: Place, arrive_by: bool) -> list[Itinerary]:
+    def _search(self, day: date, access, egress, t: int, req: PlanRequest, origin: Place, dest: Place,
+                arrive_by: bool, tz) -> list[Itinerary]:
         """Depart-at: earliest arrivals from t, then later departures.
-        Arrive-by: latest departures arriving by t, then earlier ones."""
+        Arrive-by: latest departures arriving by t, then earlier ones.
+        t is seconds after `day`'s midnight. If a service day runs out of trips, the search continues
+        into the next day (depart-at) or the previous day (arrive-by)."""
         transfer_m = min(req.max_walk_m, self.s.max_transfer_walk_m) / self.s.walk_detour
-        dirn = _Direction(self.tt, view, reverse=arrive_by)
         out: list[Itinerary] = []
         seen: set[tuple] = set()
-        for _ in range(req.num_itineraries * 3):
-            if arrive_by:
-                found = self._raptor(dirn, egress, access, -t, req.max_transfers + 1, transfer_m)
-                journeys = [self._unreverse(view, j) for j in found]
-            else:
-                journeys = self._raptor(dirn, access, egress, t, req.max_transfers + 1, transfer_m)
-            if not journeys:
-                break
-            nxt = -INF if arrive_by else INF
-            for j in journeys:
-                bus = [l for l in j.legs if isinstance(l, _BusLeg)]
-                if arrive_by:  # next search: must arrive strictly earlier
-                    nxt = max(nxt, j.arrival - 60)
-                else:  # next search: leave just after this option's latest leave time
-                    leave = int(view.trips(bus[0].pattern).dep[bus[0].trip, bus[0].board_pos]) - j.access.duration_s
-                    nxt = min(nxt, leave + 60)
-                key = tuple((l.pattern, int(view.trips(l.pattern).rows[l.trip])) for l in bus)
-                if key not in seen:
-                    seen.add(key)
-                    out.append(self._to_itinerary(view, j, midnight, origin, dest))
-            out = _drop_dominated(out)
+        for hop in range(2):
+            d = day - timedelta(days=hop) if arrive_by else day + timedelta(days=hop)
+            shift = hop * DAY if arrive_by else -hop * DAY  # same instant on d's clock = t + shift
+            view = self._view(d)
+            midnight = datetime.combine(d, time(0), tzinfo=tz)
+            dirn = _Direction(self.tt, view, reverse=arrive_by)
+            for _ in range(req.num_itineraries * 3):
+                tl = t + shift
+                if arrive_by:
+                    found = self._raptor(dirn, egress, access, -tl, req.max_transfers + 1, transfer_m)
+                    journeys = [self._unreverse(view, j) for j in found]
+                else:
+                    journeys = self._raptor(dirn, access, egress, tl, req.max_transfers + 1, transfer_m)
+                if not journeys:
+                    break
+                nxt = -INF if arrive_by else INF
+                for j in journeys:
+                    bus = [l for l in j.legs if isinstance(l, _BusLeg)]
+                    if arrive_by:  # next search: must arrive strictly earlier
+                        nxt = max(nxt, j.arrival - 60)
+                    else:  # next search: leave just after this option's latest leave time
+                        first = view.trips(bus[0].pattern)
+                        nxt = min(nxt, int(first.dep[bus[0].trip, bus[0].board_pos]) - j.access.duration_s + 60)
+                    # Same trip on the same service date = same option, whichever day's view found it.
+                    key = tuple((l.pattern, int(view.trips(l.pattern).rows[l.trip]),
+                                 d.toordinal() + int(view.trips(l.pattern).svc_offset[l.trip])) for l in bus)
+                    if key not in seen:
+                        seen.add(key)
+                        out.append(self._to_itinerary(view, j, midnight, origin, dest))
+                out = _drop_dominated(out)
+                if len(out) >= req.num_itineraries:
+                    break
+                t = (min(nxt, tl - 60) if arrive_by else max(nxt, tl + 60)) - shift
             if len(out) >= req.num_itineraries:
                 break
-            t = min(nxt, t - 60) if arrive_by else max(nxt, t + 60)
         if arrive_by:
             out.sort(key=lambda i: (-i.start.timestamp(), i.duration_s))
         else:
@@ -520,7 +546,6 @@ class Planner:
         notes: list[str] = []
         midnight = datetime.combine(when.date(), time(0), tzinfo=when.tzinfo)
         t0 = int((when.replace(tzinfo=None) - midnight.replace(tzinfo=None)).total_seconds())
-        view = self._view(when.date())
         depart = when
         o, d = req.origin, req.destination
         origin = Place(name=o.name or "Origin", lat=o.lat, lon=o.lon)
@@ -528,16 +553,21 @@ class Planner:
 
         if self.tt.feed_start and self.tt.feed_end and not (self.tt.feed_start <= when.date() <= self.tt.feed_end):
             notes.append(f"Date is outside the schedule's range ({self.tt.feed_start} to {self.tt.feed_end}).")
+        snap = self.realtime_snapshot()
+        if snap is not None and snap.stale and abs((when.date() - (snap.today or when.date())).days) <= 1:
+            notes.append("Live data is out of date, so times are from the schedule.")
 
         egress = self.egress(d.lat, d.lon, req.max_walk_m)
         itins: list[Itinerary] = []
+        searched = False
         if not egress:
             notes.append("No bus stops within walking distance of the destination.")
         else:
             if req.walk_access:
                 acc = self.walk_access(o.lat, o.lon, req.max_walk_m)
                 if acc:
-                    itins += self._search(view, acc, egress, t0, req, midnight, origin, dest, arrive_by)
+                    searched = True
+                    itins += self._search(when.date(), acc, egress, t0, req, origin, dest, arrive_by, when.tzinfo)
                 else:
                     notes.append("No bus stops within walking distance of the origin.")
             if req.park_ride:
@@ -546,12 +576,16 @@ class Planner:
                 else:
                     acc = self.park_ride_access(o.lat, o.lon, req.max_drive_m, drive)
                     if acc:
-                        itins += self._search(view, acc, egress, t0, req, midnight, origin, dest, arrive_by)
+                        searched = True
+                        itins += self._search(when.date(), acc, egress, t0, req, origin, dest, arrive_by, when.tzinfo)
                     else:
                         notes.append("No park & ride lots with nearby bus stops within driving distance.")
+        if searched and not itins:
+            notes.append(f"No bus trips found {'arriving by' if arrive_by else 'leaving after'} this time. "
+                         "Try another time, more transfers, or longer distances.")
 
         direct = haversine_m(o.lat, o.lon, d.lat, d.lon) * self.s.walk_detour
-        if req.walk_access and direct <= req.max_walk_m:
+        if req.walk_access and direct <= req.max_walk_m and self.walkable(o.lat, o.lon, d.lat, d.lon):
             dur = self.walk_s(direct)
             if arrive_by:
                 depart = when - timedelta(seconds=dur)
@@ -562,9 +596,6 @@ class Planner:
                           to_place=dest, distance_m=direct, geometry=[(o.lat, o.lon), (d.lat, d.lon)])],
             ))
 
-        if not itins and egress and not notes:
-            notes.append(f"No trips found for this time. Try {'a later arrival' if arrive_by else 'a later time'}, "
-                         "more transfers, or longer distances.")
         if arrive_by:
             itins.sort(key=lambda i: (-i.start.timestamp(), i.duration_s))
         else:

@@ -12,13 +12,16 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
-from .gtfs import load_timetable
+from .gtfs import Timetable, load_timetable
 from .lots import load_lots
+from .njt import NJTClient
 from .osm import OSMClient
 from .planner import DriveEstimate, Planner
 from .realtime import RealtimeClient
+from .schedule import ScheduleManager
 from .schemas import (AlertOut, GeocodeResult, Health, LotOut, PlanRequest, PlanResponse, RealtimeStatus,
-                      VehicleOut)
+                      ScheduleStatus, VehicleOut)
+from .water import WaterIndex
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("trip-planner")
@@ -34,18 +37,33 @@ async def lifespan(app: FastAPI):
         log.warning("Using the synthetic SAMPLE feed. Run scripts/fetch_gtfs.py for real NJ Transit data.")
     tt = await run_in_threadpool(load_timetable, gtfs, s.cache_dir, s.max_transfer_walk_m)
     lots = load_lots(s.resolved_park_ride_path)
-    planner = Planner(tt, lots, s)
-    rt = None
-    if s.realtime_active:
-        rt = RealtimeClient(s, tt)
-        planner.realtime_snapshot = lambda: rt.snapshot
-        rt.start()
-    else:
+    water = await run_in_threadpool(WaterIndex.load, s.resolved_water_path)
+    real_feed = s.njt_username and s.njt_password and not s.using_sample
+    njt = NJTClient(s) if real_feed else None
+    rt = RealtimeClient(s, tt, njt) if njt and s.realtime_enabled else None
+    if rt is None:
         log.info("Realtime disabled (needs NJT credentials and the real NJ Transit feed)")
-    state.update(settings=s, tt=tt, lots=lots, planner=planner, osm=OSMClient(s), rt=rt)
-    yield
+
+    def install(new_tt: Timetable) -> None:
+        planner = Planner(new_tt, lots, s, water)
+        if rt is not None:
+            rt.set_timetable(new_tt)
+            planner.realtime_snapshot = lambda: rt.snapshot
+        state.update(tt=new_tt, planner=planner)
+
+    install(tt)
+    schedule = ScheduleManager(s, gtfs, install, njt)
+    state.update(settings=s, lots=lots, water=water, osm=OSMClient(s), rt=rt, schedule=schedule)
     if rt:
-        await rt.close()
+        rt.start()
+    if not s.using_sample:
+        schedule.start()
+    yield
+    for task in (rt, schedule):
+        if task:
+            await task.close()
+    if njt:
+        await njt.close()
     await state["osm"].close()
 
 
@@ -62,6 +80,8 @@ def health():
         stops=tt.n_stops, routes=len(tt.routes), patterns=len(tt.patterns),
         trips=sum(len(p.trip_ids) for p in tt.patterns), feed_start=tt.feed_start, feed_end=tt.feed_end,
         park_ride_lots=len(state["lots"]), use_osrm=s.use_osrm, realtime=_rt_status(),
+        water_data=state["water"] is not None,
+        schedule=ScheduleStatus(**state["schedule"].status(ZoneInfo(s.timezone))),
     )
 
 
@@ -73,7 +93,7 @@ def _rt_status() -> RealtimeStatus:
     tz = ZoneInfo(state["settings"].timezone)
     ts = lambda t: datetime.fromtimestamp(t, tz) if t else None  # noqa: E731
     return RealtimeStatus(
-        enabled=True, last_update=ts(snap.fetched_at), feed_time=ts(snap.feed_time),
+        enabled=True, stale=snap.stale, last_update=ts(snap.fetched_at), feed_time=ts(snap.feed_time),
         trips_with_predictions=len(snap.delays), canceled_trips=len(snap.canceled), vehicles=len(snap.vehicles),
         alerts=len({a.id for alerts in snap.alerts_by_route.values() for a in alerts}), error=rt.error,
     )
@@ -83,7 +103,7 @@ def _rt_status() -> RealtimeStatus:
 def vehicles(trip_id: list[str] = Query(default=[]), route_id: list[str] = Query(default=[])):
     """Live vehicle positions, filtered by trip and/or route ids (all vehicles if neither given)."""
     rt: RealtimeClient | None = state.get("rt")
-    if rt is None:
+    if rt is None or rt.snapshot.stale:
         return []
     trips, routes = set(trip_id), set(route_id)
     return [VehicleOut.from_vehicle(v) for v in rt.snapshot.vehicles.values()

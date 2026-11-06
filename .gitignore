@@ -6,6 +6,7 @@ backend/.env
 backend/data/cache/
 backend/data/njt_bus_gtfs.zip
 backend/data/park_rides.json
+backend/data/water.json.gz
 
 # Node
 frontend/node_modules/

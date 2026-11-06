@@ -9,6 +9,7 @@ SAMPLE_GTFS = DATA_DIR / "sample" / "gtfs.zip"
 SAMPLE_LOTS = DATA_DIR / "sample" / "park_rides.json"
 DEFAULT_GTFS = DATA_DIR / "njt_bus_gtfs.zip"
 DEFAULT_LOTS = DATA_DIR / "park_rides.json"
+DEFAULT_WATER = DATA_DIR / "water.json.gz"
 
 
 class Settings(BaseSettings):
@@ -29,6 +30,13 @@ class Settings(BaseSettings):
     realtime_enabled: bool = True
     realtime_poll_s: int = 30
     alerts_poll_s: int = 300
+    realtime_max_age_s: int = 300  # ignore live data older than this (e.g. feed outage)
+    # Schedule refresh: download a new feed this often (0 = never), and reload when the file changes.
+    gtfs_refresh_hours: float = 24
+    gtfs_check_minutes: float = 5
+    # Walks whose straight line crosses more water than this are rejected (needs data/water.json.gz).
+    water_path: Path | None = None
+    max_walk_water_m: float = 400
 
     # --- OpenStreetMap services (no keys required, but respect usage policies)
     user_agent: str = "nj-trip-planner/0.1 (local development)"
@@ -65,8 +73,10 @@ class Settings(BaseSettings):
         return self.resolved_gtfs_path.resolve() == SAMPLE_GTFS.resolve()
 
     @property
-    def realtime_active(self) -> bool:
-        return self.realtime_enabled and bool(self.njt_username and self.njt_password) and not self.using_sample
+    def resolved_water_path(self) -> Path | None:
+        if self.water_path:
+            return self._abs(self.water_path)
+        return DEFAULT_WATER if DEFAULT_WATER.exists() and not self.using_sample else None
 
     @property
     def resolved_park_ride_path(self) -> Path | None:
